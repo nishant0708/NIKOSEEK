@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/vite-env.d.ts","./src/components/layout/appnavbar.tsx","./src/components/ui/button.tsx","./src/components/ui/input.tsx","./src/lib/api.ts","./src/lib/utils.ts","./src/pages/jobsearch.tsx","./src/pages/profilereview.tsx","./src/pages/resumeonboarding.tsx","./src/pages/workflow.tsx"],"version":"5.9.3"}

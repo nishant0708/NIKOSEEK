@@ -1,0 +1,16 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700;9..40,800&family=Fraunces:opsz,wght@9..144,700;9..144,800;9..144,900&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html { min-height: 100%; background: #FFF7EB; }
+  body { margin: 0; min-height: 100%; font-family: 'DM Sans', system-ui, sans-serif; color: #2B1D15; }
+  button, input, select { font: inherit; }
+}
+
+@layer utilities {
+  .font-display { font-family: 'Fraunces', Georgia, serif; }
+  .orange-orb { position: absolute; height: 330px; width: 330px; border-radius: 9999px; background: radial-gradient(circle, rgba(255, 184, 111, .62), rgba(255, 197, 138, 0) 70%); filter: blur(3px); }
+}
