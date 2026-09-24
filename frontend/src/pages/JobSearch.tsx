@@ -116,6 +116,8 @@ export function JobSearch({ token }: { token: string }) {
   const [rejected, setRejected] = useState<Job[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [hasSearched, setHasSearched] = useState(false);
+  const [lastSearchSource, setLastSearchSource] = useState('');
   const [showRejected, setShowRejected] = useState(false);
   const [sortBy, setSortBy] = useState<SortOption>('match-high');
 
@@ -149,6 +151,8 @@ export function JobSearch({ token }: { token: string }) {
 
       setAccepted(result.accepted_jobs);
       setRejected(result.rejected_jobs);
+      setLastSearchSource(source);
+      setHasSearched(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Search failed.');
     } finally {
@@ -196,6 +200,7 @@ export function JobSearch({ token }: { token: string }) {
           >
             <option value="linkedin">LinkedIn</option>
             <option value="indeed">Indeed</option>
+            <option value="naukri">Naukri</option>
           </select>
 
           <div className="flex overflow-hidden rounded-2xl bg-[#FFF9F0]">
@@ -318,7 +323,9 @@ export function JobSearch({ token }: { token: string }) {
 
           {!sortedJobs.length && (
             <p className="rounded-2xl border border-dashed border-[#E5BB91] p-10 text-center text-[#875D42]">
-              Search to populate this board.
+              {hasSearched
+                ? `No jobs were returned by ${lastSearchSource} for this search. Try a broader role, location, or date range.`
+                : 'Search to populate this board.'}
             </p>
           )}
         </div>

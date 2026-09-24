@@ -1,6 +1,9 @@
 from datetime import UTC, datetime
 import logging
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import pandas as pd
 from fastapi import APIRouter, HTTPException, status
@@ -19,7 +22,11 @@ from app.services.storage import read_details_markdown, read_profile_markdown
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 logger = logging.getLogger(__name__)
 
-SUPPORTED_SOURCES = {"linkedin", "indeed"}
+SUPPORTED_SOURCES = {"linkedin", "indeed", "naukri"}
+NAUKRI_SEARCH_URL = "https://www.naukri.com/jobapi/v3/search"
+# Keep requests small enough to stop early, without sending one Gemini request
+# per listing (which can trigger rate limits and produce a 502 response).
+SCORING_BATCH_SIZE = 5
 
 
 def row_value(row: Any, name: str) -> str | None:
@@ -51,6 +58,66 @@ def to_read(job: ScrapedJob) -> JobRead:
         ai_reason=job.ai_reason,
         experience_match=job.experience_match,
     )
+
+
+def verify_naukri_available(payload: JobScrapeRequest) -> None:
+    """Raise a useful API error when Naukri blocks automated searches.
+
+    JobSpy currently turns Naukri's CAPTCHA response into an empty DataFrame,
+    which otherwise makes a blocked search indistinguishable from no matches.
+    """
+    params = {
+        "noOfResults": 1,
+        "urlType": "search_by_keyword",
+        "searchType": "adv",
+        "keyword": payload.search_term,
+        "k": payload.search_term,
+        "pageNo": 1,
+        "seoKey": f"{payload.search_term.lower().replace(' ', '-')}-jobs",
+        "src": "jobsearchDesk",
+        "location": payload.location,
+        "days": payload.hours_old // 24,
+    }
+    request = Request(
+        f"{NAUKRI_SEARCH_URL}?{urlencode(params)}",
+        headers={
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://www.naukri.com/",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "appid": "109",
+            "systemid": "Naukri",
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=15):
+            return
+    except HTTPError as exc:
+        response_body = exc.read().decode("utf-8", errors="replace").lower()
+
+        if exc.code == 406 and "recaptcha" in response_body:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Naukri is requiring CAPTCHA verification and cannot be "
+                    "searched automatically right now. Try LinkedIn or Indeed, "
+                    "or retry later from a network Naukri does not challenge."
+                ),
+            ) from exc
+
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Naukri search is unavailable (HTTP {exc.code}).",
+        ) from exc
+    except URLError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Naukri search could not be reached.",
+        ) from exc
 
 
 def scrape_source(payload: JobScrapeRequest, source: str) -> pd.DataFrame:
@@ -109,6 +176,9 @@ def scrape_source(payload: JobScrapeRequest, source: str) -> pd.DataFrame:
         payload.location,
     )
 
+    if source == "naukri":
+        verify_naukri_available(payload)
+
     return scrape_jobs(**kwargs)
 
 
@@ -123,7 +193,7 @@ def scrape_jobs(
     if unknown_sources:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Only LinkedIn and Indeed are available in this phase.",
+            detail="Only LinkedIn, Indeed, and Naukri are available in this phase.",
         )
 
     if not payload.sources:
@@ -229,84 +299,94 @@ def scrape_jobs(
 
         model = get_match_scoring_model(user)
 
-        analyses, usage = score_jobs(
-            scraped,
-            profile,
-            details,
-            payload,
-            model,
-            get_match_scoring_prompt(db),
-        )
-
-        by_number = {
-            item.get("job_number"): item
-            for item in analyses
-            if item.get("job_number") is not None
-        }
-
         accepted: list[JobRead] = []
         rejected: list[JobRead] = []
         saved_count = 0
+        usage = {"input": 0, "output": 0, "total": 0}
+        scoring_prompt = get_match_scoring_prompt(db)
 
-        for index, raw in enumerate(scraped, start=1):
-            analysis = by_number.get(
-                index,
-                {
-                    "accepted": False,
-                    "match_score": 0,
-                    "reason": "No score returned.",
-                    "experience_match": "Unknown",
-                },
+        for batch_start in range(0, len(scraped), SCORING_BATCH_SIZE):
+            batch = scraped[batch_start : batch_start + SCORING_BATCH_SIZE]
+            analyses, job_usage = score_jobs(
+                batch,
+                profile,
+                details,
+                payload,
+                model,
+                scoring_prompt,
             )
+            for token_type in usage:
+                usage[token_type] += job_usage[token_type]
 
-            # Keep additional matching jobs accepted, while marking them so the
-            # client can place them in the separate "Also relevant" section.
-            if (
-                bool(analysis.get("accepted"))
-                and len(accepted) >= payload.target_relevant_count
-            ):
-                analysis = {
-                    **analysis,
-                    "reason": "Relevant-job target reached for this search.",
-                }
+            analyses_by_number = {
+                item.get("job_number"): item
+                for item in analyses
+                if item.get("job_number") is not None
+            }
 
-            job = ScrapedJob(
-                user_id=user.id,
-                search_run_id=run.id,
-                **raw,
-            )
-
-            candidate = attach_analysis(to_read(job), analysis)
-
-            job.ai_status = candidate.ai_status
-            job.match_score = candidate.match_score
-            job.ai_reason = candidate.ai_reason
-            job.experience_match = candidate.experience_match
-
-            job.llm_input_tokens = usage["input"] // max(len(scraped), 1)
-            job.llm_output_tokens = usage["output"] // max(len(scraped), 1)
-            job.llm_total_tokens = usage["total"] // max(len(scraped), 1)
-
-            db.add(job)
-
-            try:
-                db.commit()
-                db.refresh(job)
-                saved_count += 1
-
-                if job.ai_status == "ACCEPTED":
-                    accepted.append(to_read(job))
-                else:
-                    rejected.append(to_read(job))
-
-            except IntegrityError:
-                # Usually means that this URL was already saved.
-                db.rollback()
-                logger.info(
-                    "Skipping duplicate job URL for search run %s: %s",
-                    run.id,
-                    raw["external_url"],
+            for index, raw in enumerate(batch, start=1):
+                analysis = analyses_by_number.get(
+                    index,
+                    {
+                        "accepted": False,
+                        "match_score": 0,
+                        "reason": "No score returned.",
+                        "experience_match": "Unknown",
+                    },
                 )
+
+                job = ScrapedJob(
+                    user_id=user.id,
+                    search_run_id=run.id,
+                    **raw,
+                )
+
+                candidate = attach_analysis(to_read(job), analysis)
+
+                job.ai_status = candidate.ai_status
+                job.match_score = candidate.match_score
+                job.ai_reason = candidate.ai_reason
+                job.experience_match = candidate.experience_match
+
+                # Gemini reports usage for the full batch. Split it across the
+                # corresponding job records while retaining the exact total on
+                # the search run below.
+                job.llm_input_tokens = job_usage["input"] // len(batch)
+                job.llm_output_tokens = job_usage["output"] // len(batch)
+                job.llm_total_tokens = job_usage["total"] // len(batch)
+
+                db.add(job)
+
+                try:
+                    db.commit()
+                    db.refresh(job)
+                    saved_count += 1
+
+                    if job.ai_status == "ACCEPTED":
+                        accepted.append(to_read(job))
+                    else:
+                        rejected.append(to_read(job))
+
+                    if len(accepted) >= payload.target_relevant_count:
+                        logger.info(
+                            "Search run %s reached its relevant-job target (%s); "
+                            "stopping LLM scoring.",
+                            run.id,
+                            payload.target_relevant_count,
+                        )
+                        break
+
+                except IntegrityError:
+                    # Usually means that this URL was already saved.
+                    db.rollback()
+                    logger.info(
+                        "Skipping duplicate job URL for search run %s: %s",
+                        run.id,
+                        raw["external_url"],
+                    )
+
+            if len(accepted) >= payload.target_relevant_count:
+                break
 
         run.status = "SUCCEEDED"
         run.fetched_count = len(scraped)
