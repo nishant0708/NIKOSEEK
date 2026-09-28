@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import CurrentUser, DbSession
-from app.db.models import ScrapedJob, SearchRun
+from app.db.models import Application, ScrapedJob, SearchRun
 from app.schemas.jobs import JobRead, JobScrapeRequest, JobScrapeResponse
 from app.services.agent_config import get_match_scoring_model, get_match_scoring_prompt
 from app.services.job_matching import attach_analysis, score_jobs
@@ -97,9 +97,14 @@ def scrape_jobs(payload: JobScrapeRequest, user: CurrentUser, db: DbSession) -> 
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Job search failed") from exc
 
 
+QUEUED_APPLICATION_STATUSES = {"QUEUED", "IN_PROGRESS", "FAILED", "HUMAN_REVIEW_REQUIRED", "APPLIED", "SUCCEEDED"}
+
+
 @router.get("", response_model=list[JobRead])
 def list_jobs(user: CurrentUser, db: DbSession, status_filter: str | None = None) -> list[JobRead]:
-    query = db.query(ScrapedJob).filter(ScrapedJob.user_id == user.id)
+    queued_job_ids = db.query(Application.job_id).filter(Application.user_id == user.id)
+    query = db.query(ScrapedJob).filter(ScrapedJob.user_id == user.id, ~ScrapedJob.id.in_(queued_job_ids))
+    query = query.filter(~ScrapedJob.application_status.in_(QUEUED_APPLICATION_STATUSES))
     if status_filter:
         query = query.filter(ScrapedJob.ai_status == status_filter.upper())
     return [to_read(job) for job in query.order_by(ScrapedJob.match_score.desc().nullslast(), ScrapedJob.scraped_at.desc()).all()]

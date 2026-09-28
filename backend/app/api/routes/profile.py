@@ -1,7 +1,8 @@
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from app.api.deps import CurrentUser
+from app.api.deps import CurrentUser, DbSession
+from app.services.agent_config import linkedin_public_payload, set_linkedin_credentials
 from app.services.storage import PROFILE_TEMPLATE, read_profile_markdown, save_profile_markdown
 from app.services.storage import read_details_markdown
 from app.services.profile_generation import generate_profile_documents
@@ -17,6 +18,16 @@ class ProfileGenerationRequest(BaseModel):
     resume_key: str
     projects: str = ""
     achievements: str = ""
+
+
+class LinkedInCredentialsRead(BaseModel):
+    email: str = ""
+    password_set: bool = False
+
+
+class LinkedInCredentialsUpdate(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str | None = Field(default=None, max_length=200)
 
 
 @router.get("")
@@ -44,6 +55,25 @@ def update_profile(payload: ProfileMarkdown, user: CurrentUser) -> dict[str, str
 def generate_profile(payload: ProfileGenerationRequest, user: CurrentUser) -> dict[str, str]:
     details, profile = generate_profile_documents(user.username, payload.resume_key, payload.projects, payload.achievements)
     return {"details_markdown": details, "profile_markdown": profile}
+
+
+@router.get("/linkedin")
+def get_linkedin_credentials(user: CurrentUser) -> LinkedInCredentialsRead:
+    return LinkedInCredentialsRead.model_validate(linkedin_public_payload(user))
+
+
+@router.put("/linkedin")
+def update_linkedin_credentials(payload: LinkedInCredentialsUpdate, user: CurrentUser, db: DbSession) -> LinkedInCredentialsRead:
+    current = linkedin_public_payload(user)
+    if payload.password is not None and 0 < len(payload.password.strip()) < 6:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="LinkedIn password must be at least 6 characters")
+    password = payload.password.strip() if payload.password and payload.password.strip() else None
+    if not password and not current["password_set"]:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Enter a LinkedIn password to save credentials")
+    set_linkedin_credentials(user, payload.email, password)
+    db.commit()
+    db.refresh(user)
+    return LinkedInCredentialsRead.model_validate(linkedin_public_payload(user))
 
 
 @router.post("/upload")

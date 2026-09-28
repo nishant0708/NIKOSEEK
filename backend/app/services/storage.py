@@ -141,3 +141,21 @@ def has_resume(username: str) -> bool:
         # A missing user prefix is equivalent to no uploaded resume.
         return False
     return False
+
+
+def list_resumes(username: str) -> list[dict[str, str]]:
+    bucket = _client().storage.from_(settings.supabase_storage_bucket)
+    resumes: list[dict[str, str]] = []
+    try:
+        roles = bucket.list(_key(username, "Resumes"))
+        for role in roles:
+            role_name = role.get("name", "")
+            if not role_name or role_name == ".keep":
+                continue
+            for item in bucket.list(_key(username, "Resumes", role_name)):
+                file_name = item.get("name", "")
+                if file_name.endswith((".pdf", ".docx")):
+                    resumes.append({"storage_key": _key(username, "Resumes", role_name, file_name), "role": role_name, "file_name": file_name})
+    except Exception:
+        return []
+    return resumes
