@@ -1,11 +1,13 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent, type ReactElement } from 'react';
 import { ArrowRight, Check, Flame, LoaderCircle, Sparkles } from 'lucide-react';
 import { BrowserRouter, Navigate, Route, Routes, useNavigate } from 'react-router-dom';
 import { AppNavbar } from './components/layout/AppNavbar';
 import { Button } from './components/ui/button';
 import { Input } from './components/ui/input';
 import { api, type User } from './lib/api';
+import { ConnectLinkedIn } from './pages/ConnectLinkedIn';
 import { JobSearch } from './pages/JobSearch';
+import { LiveWorkflow } from './pages/LiveWorkflow';
 import { ProfileReview } from './pages/ProfileReview';
 import { ResumeOnboarding } from './pages/ResumeOnboarding';
 import { Workflow } from './pages/Workflow';
@@ -21,14 +23,19 @@ function AppRoutes() {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('jobflow_token'));
   const [user, setUser] = useState<User | null>(null);
   const [checking, setChecking] = useState(Boolean(token));
+  // LinkedIn must be connected before the job/apply pages are usable (see ConnectLinkedIn).
+  const [linkedinReady, setLinkedinReady] = useState(false);
 
   useEffect(() => {
     if (!token) { setChecking(false); return; }
     setChecking(true);
-    Promise.all([api.me(token), api.resumeStatus(token), api.profile(token)])
-      .then(([me, resume, profile]) => {
+    Promise.all([api.me(token), api.resumeStatus(token), api.profile(token), api.linkedinSession(token).catch(() => null)])
+      .then(([me, resume, profile, linkedin]) => {
         setUser(me);
+        const ready = linkedin?.status === 'READY';
+        setLinkedinReady(ready);
         if (!resume.has_resume || !profile.markdown) navigate('/onboarding', { replace: true });
+        else if (!ready) navigate('/connect-linkedin', { replace: true });
       })
       .catch(() => { localStorage.removeItem('jobflow_token'); setToken(null); setUser(null); navigate('/', { replace: true }); })
       .finally(() => setChecking(false));
@@ -45,10 +52,14 @@ function AppRoutes() {
   if (checking) return <Loading />;
   if (!token || !user) return <Auth onDone={completeAuth} />;
 
+  const requireLinkedin = (element: ReactElement) => (linkedinReady ? element : <Navigate to="/connect-linkedin" replace />);
+
   return <><AppNavbar user={user} onLogout={logout} /><Routes>
-    <Route path="/" element={<JobSearch token={token} />} />
-    <Route path="/workflow" element={<Workflow token={token} />} />
-    <Route path="/profile" element={<ProfileReview token={token} onDone={() => navigate('/')} />} />
+    <Route path="/" element={requireLinkedin(<JobSearch token={token} />)} />
+    <Route path="/workflow" element={requireLinkedin(<Workflow token={token} />)} />
+    <Route path="/workflow/live" element={requireLinkedin(<LiveWorkflow token={token} />)} />
+    <Route path="/connect-linkedin" element={<ConnectLinkedIn token={token} onConnected={() => { setLinkedinReady(true); navigate('/'); }} />} />
+    <Route path="/profile" element={<ProfileReview token={token} onDone={() => navigate('/')} onLinkedinChange={setLinkedinReady} />} />
     <Route path="/onboarding" element={<ResumeOnboarding token={token} onDone={() => navigate('/profile')} />} />
     <Route path="*" element={<Navigate to="/" replace />} />
   </Routes></>;
