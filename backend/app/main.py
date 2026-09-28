@@ -5,7 +5,7 @@ import time
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import agent_config, applications, auth, jobs, profile, resumes
+from app.api.routes import agent_config, applications, auth, jobs, linkedin, profile, resumes
 from app.core.config import settings
 from app.core.logging import configure_logging
 from app.db.base import Base
@@ -29,6 +29,7 @@ app.include_router(resumes.router, prefix="/api/v1")
 app.include_router(jobs.router, prefix="/api/v1")
 app.include_router(applications.router, prefix="/api/v1")
 app.include_router(agent_config.router, prefix="/api/v1")
+app.include_router(linkedin.router, prefix="/api/v1")
 
 
 @app.middleware("http")
@@ -58,6 +59,9 @@ async def shutdown() -> None:
     worker = getattr(app.state, "application_worker", None)
     if worker is not None:
         worker.cancel()
+    from app.services.linkedin_browser import linkedin_browser
+
+    await linkedin_browser.shutdown()
 
 
 async def application_worker() -> None:
@@ -66,7 +70,11 @@ async def application_worker() -> None:
         try:
             from app.services.applications import process_application
 
-            await process_application(application_id, SessionLocal, user_id)
+            # Own task per application so "Move to failed" can cancel a stuck run without killing the worker.
+            task = asyncio.create_task(process_application(application_id, SessionLocal, user_id))
+            await asyncio.wait({task})
+        except Exception:
+            logger.exception("Application worker crashed on application %s", application_id)
         finally:
             app.state.application_queue.task_done()
 

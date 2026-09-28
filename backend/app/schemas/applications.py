@@ -32,6 +32,10 @@ class ApplicationRead(BaseModel):
     started_at: datetime | None = None
     applied_at: datetime | None = None
     completed_at: datetime | None = None
+    llm_input_tokens: int = 0
+    llm_output_tokens: int = 0
+    llm_total_tokens: int = 0
+    llm_calls: int = 0
     job: ApplicationJobRead
 
 
@@ -43,3 +47,13 @@ class ApplicationQueueRequest(BaseModel):
 class ApplicationQueueResponse(BaseModel):
     message: str
     applications: list[ApplicationRead]
+
+
+class ApplicationFieldValues(BaseModel):
+    values: dict[str, str] = Field(min_length=1)
+    remember: bool = True
+
+
+class ApplicationStatusUpdate(BaseModel):
+    status: str = Field(pattern="^(FAILED|COMPLETED|REJECTED)$")
+    reason: str | None = Field(default=None, max_length=500)

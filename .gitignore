@@ -51,3 +51,5 @@ Thumbs.db
 # Logs
 *.log
 logs/
+# Persistent per-user browser profiles (LinkedIn session cookies)
+backend/.browser_profiles/

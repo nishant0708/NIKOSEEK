@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, func
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -92,8 +92,32 @@ class Application(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # AI usage of the apply agent for this application (all attempts).
+    llm_input_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    llm_output_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    llm_total_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    llm_calls: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     user: Mapped[User] = relationship(back_populates="applications")
     job: Mapped[ScrapedJob] = relationship(back_populates="applications", foreign_keys=[job_id])
+    events: Mapped[list["ApplicationEvent"]] = relationship(back_populates="application", cascade="all, delete-orphan", passive_deletes=True)
+
+
+class ApplicationEvent(Base):
+    """Step-by-step log of one application run: stage changes, what the AI decided and why, actions, errors."""
+
+    __tablename__ = "job_application_events"
+    __table_args__ = (Index("job_application_events_app_attempt_idx", "application_id", "attempt", "id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    application_id: Mapped[int] = mapped_column(ForeignKey("job_applications.id", ondelete="CASCADE"))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    stage_key: Mapped[str] = mapped_column(String(20), default="open")  # open|login|find|fields|review|failed
+    kind: Mapped[str] = mapped_column(String(20), default="info")  # stage|thinking|action|info|warning|error
+    message: Mapped[str] = mapped_column(Text)
+    data: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    application: Mapped[Application] = relationship(back_populates="events")
 
 
 class BrowserSession(Base):
