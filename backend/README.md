@@ -29,5 +29,12 @@ Supabase Storage uses virtual object prefixes and creates this layout on signup:
 
 1. Upload a resume, then `POST /api/v1/profile/generate` with its `storage_key`, extra project details, and achievements. This saves private `Profile/details.md` and generated `Profile/profile.md` objects in Supabase Storage.
 2. Review and edit `profile.md` using `GET`/`PUT /api/v1/profile`.
-3. Send job-search preferences (`experience`, `min_salary_lpa`, and `target_relevant_count` included) to `POST /api/v1/jobs/scrape`. LinkedIn, Indeed, and Naukri are supported; Indeed additionally requires `indeed_country`.
-4. Gemini scores jobs in small batches until it finds `target_relevant_count` relevant results, then stops before scoring more batches to avoid consuming tokens on the remaining listings. The response separates `accepted_jobs` and `rejected_jobs`; each has `match_score`, `ai_reason`, and `experience_match`. `GET /api/v1/jobs/runs` supplies the run state for a React Flow status UI.
+3. Send job-search preferences (`experience`, `min_salary_lpa`, and `target_relevant_count` included) to `POST /api/v1/jobs/scrape`.
+4. Gemini scores every scraped job. The response separates `accepted_jobs` and `rejected_jobs`; each has `match_score`, `ai_reason`, and `experience_match`. `GET /api/v1/jobs/runs` supplies the run state for a React Flow status UI.
+
+## Application queue
+
+1. `GET /api/v1/resumes` lists the resume objects available for the current user.
+2. `POST /api/v1/applications/apply` queues selected accepted jobs, stores the resume key used, and creates a `job_applications` row for each job.
+3. `GET /api/v1/applications` returns the current queue state.
+4. `WS /api/v1/applications/ws?token=...` streams live application updates so the workflow UI can glow on the active step.

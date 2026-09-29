@@ -1,7 +1,8 @@
 """Small Gemini gateway shared by profile generation and job matching."""
 import json
 import logging
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 
 from fastapi import HTTPException, status
 from google import genai
@@ -18,6 +19,37 @@ class LLMJsonResult:
     input_tokens: int
     output_tokens: int
     total_tokens: int
+
+
+@dataclass
+class TokenMeter:
+    """Counts tokens of every AI call made while it is active (see use_meter). `take()` returns the usage since the last take."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    calls: int = 0
+    _pending: dict = field(default_factory=lambda: {"input": 0, "output": 0, "total": 0, "calls": 0})
+
+    def add(self, usage) -> None:
+        inp = int(getattr(usage, "prompt_token_count", 0) or 0)
+        out = int(getattr(usage, "candidates_token_count", 0) or 0)
+        tot = int(getattr(usage, "total_token_count", 0) or 0) or inp + out
+        self.input_tokens += inp
+        self.output_tokens += out
+        self.total_tokens += tot
+        self.calls += 1
+        for key, value in (("input", inp), ("output", out), ("total", tot), ("calls", 1)):
+            self._pending[key] += value
+
+    def take(self) -> dict | None:
+        if not self._pending["calls"]:
+            return None
+        pending, self._pending = self._pending, {"input": 0, "output": 0, "total": 0, "calls": 0}
+        return pending
+
+
+current_meter: ContextVar[TokenMeter | None] = ContextVar("current_meter", default=None)
 
 
 def generate_text(prompt: str, system_instruction: str) -> str:
@@ -59,3 +91,28 @@ def generate_json(prompt: str, system_instruction: str, schema: dict, model: str
         logger.exception("Gemini job scoring failed for model %s", model or settings.ai_model)
         detail = "The configured AI model is unavailable. Update the scoring model in the workflow settings." if getattr(exc, "code", None) == 404 else "The LLM could not score the jobs"
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
+
+
+async def generate_json_object(prompt: str, model: str | None = None) -> dict:
+    """Async Gemini call that must return one JSON object (used by the live apply worker).
+
+    Raises instead of returning HTTP errors because it runs inside the background worker.
+    """
+    if not settings.gemini_api_key:
+        raise RuntimeError("LLM is not configured. Set GEMINI_API_KEY on the backend.")
+    client = genai.Client(api_key=settings.gemini_api_key)
+    response = await client.aio.models.generate_content(
+        model=model or settings.ai_model,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0, response_mime_type="application/json"),
+    )
+    meter = current_meter.get()
+    if meter is not None:
+        meter.add(response.usage_metadata)
+    text = (response.text or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`").removeprefix("json").strip()
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("Gemini returned a non-object JSON response")
+    return data
