@@ -5,6 +5,7 @@ class JobScrapeRequest(BaseModel):
     sources: list[str] = Field(min_length=1, max_length=4, examples=[["linkedin"]])
     search_term: str = Field(min_length=2, max_length=200)
     location: str = Field(default="India", min_length=2, max_length=200)
+    country_indeed: str | None = Field(default=None, min_length=2, max_length=100, description="Indeed country, e.g. India or USA")
     job_type: str | None = Field(default=None, max_length=50, description="e.g. fulltime, parttime, internship")
     # JobSpy requires a concrete boolean; clients may omit this to mean false.
     is_remote: bool = False

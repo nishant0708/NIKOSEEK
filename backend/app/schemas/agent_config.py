@@ -21,3 +21,7 @@ class SystemPromptUpdate(BaseModel):
 
 class AdminStatusUpdate(BaseModel):
     is_admin: bool
+
+
+class AgentPromptUpdate(BaseModel):
+    content: str = Field(min_length=20, max_length=20000)

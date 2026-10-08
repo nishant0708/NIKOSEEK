@@ -5,10 +5,10 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import CurrentUser, DbSession
-from app.db.models import ScrapedJob, SearchRun
+from app.db.models import Application, ScrapedJob, SearchRun
 from app.schemas.jobs import JobRead, JobScrapeRequest, JobScrapeResponse
 from app.services.agent_config import get_match_scoring_model, get_match_scoring_prompt
-from app.services.job_matching import attach_analysis, score_jobs
+from app.services.job_matching import attach_analysis, score_jobs_until_target
 from app.services.storage import read_details_markdown, read_profile_markdown
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -45,7 +45,21 @@ def scrape_jobs(payload: JobScrapeRequest, user: CurrentUser, db: DbSession) -> 
     try:
         from jobspy import scrape_jobs as run_scraper
         logger.info("Search run %s: fetching jobs from JobSpy", run.id)
-        dataframe = run_scraper(site_name=payload.sources, search_term=payload.search_term, location=payload.location, results_wanted=payload.results_wanted, hours_old=payload.hours_old, job_type=payload.job_type, is_remote=bool(payload.is_remote), verbose=0)
+        scraper_args = {
+            "site_name": payload.sources,
+            "search_term": payload.search_term,
+            "location": payload.location,
+            "results_wanted": payload.results_wanted,
+            "hours_old": payload.hours_old,
+            "job_type": payload.job_type,
+            "is_remote": bool(payload.is_remote),
+            "verbose": 0,
+        }
+        # JobSpy uses country_indeed to select Indeed's regional catalogue;
+        # location alone is not enough for countries with the same city names.
+        if "indeed" in payload.sources and payload.country_indeed:
+            scraper_args["country_indeed"] = payload.country_indeed
+        dataframe = run_scraper(**scraper_args)
         scraped: list[dict] = []
         for _, row in dataframe.iterrows():
             url = row_value(row, "job_url")
@@ -57,25 +71,24 @@ def scrape_jobs(payload: JobScrapeRequest, user: CurrentUser, db: DbSession) -> 
             db.commit()
             return JobScrapeResponse(run_id=run.id, accepted_jobs=[], rejected_jobs=[], fetched_count=0, saved_count=0)
         model = get_match_scoring_model(user)
-        logger.info("Search run %s: scoring %s jobs with model=%s", run.id, len(scraped), model)
-        analyses, usage = score_jobs(scraped, profile, details, payload, model, get_match_scoring_prompt(db))
+        logger.info("Search run %s: scoring up to %s jobs until %s matches are accepted with model=%s", run.id, len(scraped), payload.target_relevant_count, model)
+        analyses, usage = score_jobs_until_target(scraped, profile, details, payload, model, get_match_scoring_prompt(db))
         by_number = {item.get("job_number"): item for item in analyses}
         accepted: list[JobRead] = []
         rejected: list[JobRead] = []
         saved_count = 0
-        for index, raw in enumerate(scraped, start=1):
+        # `analyses` only contains jobs through the requested accepted-job
+        # target. Do not persist them or issue more scoring calls afterward.
+        for index, raw in enumerate(scraped[:len(analyses)], start=1):
             analysis = by_number.get(index, {"accepted": False, "match_score": 0, "reason": "No score returned", "experience_match": "Unknown"})
-            is_accepted = bool(analysis.get("accepted"))
-            if is_accepted and len(accepted) >= payload.target_relevant_count:
-                analysis = {**analysis, "accepted": False, "reason": "Relevant-job target reached for this search"}
             job = ScrapedJob(user_id=user.id, search_run_id=run.id, **raw)
             candidate = attach_analysis(to_read(job), analysis)
             job.ai_status, job.match_score, job.ai_reason, job.experience_match = candidate.ai_status, candidate.match_score, candidate.ai_reason, candidate.experience_match
             # Gemini returns usage for the batch. Attribute it evenly so each job
             # retains a durable match-cost record without exposing it in the UI.
-            job.llm_input_tokens = usage["input"] // max(len(scraped), 1)
-            job.llm_output_tokens = usage["output"] // max(len(scraped), 1)
-            job.llm_total_tokens = usage["total"] // max(len(scraped), 1)
+            job.llm_input_tokens = usage["input"] // max(len(analyses), 1)
+            job.llm_output_tokens = usage["output"] // max(len(analyses), 1)
+            job.llm_total_tokens = usage["total"] // max(len(analyses), 1)
             db.add(job)
             try:
                 db.commit(); db.refresh(job); saved_count += 1
@@ -97,9 +110,14 @@ def scrape_jobs(payload: JobScrapeRequest, user: CurrentUser, db: DbSession) -> 
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Job search failed") from exc
 
 
+QUEUED_APPLICATION_STATUSES = {"QUEUED", "IN_PROGRESS", "FAILED", "HUMAN_REVIEW_REQUIRED", "APPLIED", "SUCCEEDED"}
+
+
 @router.get("", response_model=list[JobRead])
 def list_jobs(user: CurrentUser, db: DbSession, status_filter: str | None = None) -> list[JobRead]:
-    query = db.query(ScrapedJob).filter(ScrapedJob.user_id == user.id)
+    queued_job_ids = db.query(Application.job_id).filter(Application.user_id == user.id)
+    query = db.query(ScrapedJob).filter(ScrapedJob.user_id == user.id, ~ScrapedJob.id.in_(queued_job_ids))
+    query = query.filter(~ScrapedJob.application_status.in_(QUEUED_APPLICATION_STATUSES))
     if status_filter:
         query = query.filter(ScrapedJob.ai_status == status_filter.upper())
     return [to_read(job) for job in query.order_by(ScrapedJob.match_score.desc().nullslast(), ScrapedJob.scraped_at.desc()).all()]

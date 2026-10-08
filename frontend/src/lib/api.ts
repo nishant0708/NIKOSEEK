@@ -4,6 +4,26 @@ export type User = { id: number; username: string; created_at: string; is_admin:
 export type AgentConfig = { match_scoring: { model: string }; system_prompt: string; can_edit_system_prompt: boolean };
 export type AuthResponse = { access_token: string; token_type: string; user: User };
 export type Job = { id?: number; source: string; external_url: string; title?: string; company?: string; location?: string; description?: string; date_posted?: string; ai_status: string; match_score?: number; ai_reason?: string; experience_match?: string };
+export type ApplicationJob = { id: number; source: string; external_url: string; title?: string; company?: string; location?: string; ai_status: string; match_score?: number };
+export type Application = { id: number; job_id: number; resume_key: string; resume_role?: string | null; status: string; stage: string; queue_position: number; application_url?: string | null; form_data?: Record<string, unknown>; error?: string | null; created_at: string; updated_at: string; started_at?: string | null; applied_at?: string | null; completed_at?: string | null; llm_input_tokens?: number; llm_output_tokens?: number; llm_total_tokens?: number; llm_calls?: number; job: ApplicationJob };
+export type ApplicationQueueResponse = { message: string; applications: Application[] };
+export type LinkedInCredentials = { email: string; password_set: boolean };
+export type LinkedInSessionStatus = 'NEEDS_LOGIN' | 'LOGIN_IN_PROGRESS' | 'READY';
+export type LinkedInSession = { source: string; status: LinkedInSessionStatus; connected: boolean; last_login_at?: string | null; last_checked_at?: string | null; error?: string | null; credentials: LinkedInCredentials };
+export const LINKEDIN_NOT_CONNECTED = 'LINKEDIN_NOT_CONNECTED';
+export type IndeedCredentials = { email: string; password_set: boolean };
+export type IndeedSession = { source: string; status: LinkedInSessionStatus; connected: boolean; last_login_at?: string | null; last_checked_at?: string | null; error?: string | null; credentials: IndeedCredentials };
+export const INDEED_NOT_CONNECTED = 'INDEED_NOT_CONNECTED';
+export type AgentStageKey = 'open' | 'login' | 'find' | 'fields' | 'review' | 'failed';
+export type AgentEventKind = 'stage' | 'thinking' | 'action' | 'info' | 'warning' | 'error';
+export type AgentEvent = { id: number | null; application_id: number; attempt: number; stage_key: AgentStageKey; kind: AgentEventKind; message: string; data: Record<string, unknown>; created_at: string | null };
+export type FormFieldKind = 'text' | 'textarea' | 'select' | 'radio' | 'checkbox' | 'combobox';
+export type FormField = { key: string; kind: FormFieldKind; label: string; name?: string | null; required: boolean; options?: string[] | null; value: string; error?: string; source?: 'ai' | 'user' | 'prefilled' | null; group?: string | null };
+export type ApplicationFormData = { mode?: 'external' | 'easy_apply'; session_open?: boolean; url?: string | null; step?: number; fields?: FormField[]; missing?: string[]; missing_required?: string[]; has_next?: boolean; can_submit?: boolean; submit_available?: boolean; resume_uploaded?: string | null; mapping?: string; answers?: FormAnswer[] };
+export type FormAnswer = { step: number; label: string; value: string; source?: 'ai' | 'user' | 'prefilled' | null; kind: FormFieldKind };
+export type ManualStatus = 'FAILED' | 'COMPLETED' | 'REJECTED';
+export type AgentPrompt = { key: string; title: string; description: string; variables: string[]; output: string; default: string; content: string; customized: boolean };
+export type AgentEventsResponse = { application_id: number; attempt: number; events: AgentEvent[] };
 
 async function request<T>(path: string, init: RequestInit = {}, token?: string): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, {
@@ -15,6 +35,14 @@ async function request<T>(path: string, init: RequestInit = {}, token?: string):
     throw new Error(data?.detail ?? 'Something went wrong. Please try again.');
   }
   return response.json() as Promise<T>;
+}
+
+function applicationSocketUrl(token: string) {
+  const url = new URL(API_URL);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  url.pathname = `${url.pathname.replace(/\/$/, '')}/applications/ws`;
+  url.searchParams.set('token', token);
+  return url.toString();
 }
 
 export const api = {
@@ -29,8 +57,29 @@ export const api = {
   generateProfile: (token: string, payload: { resume_key: string; projects: string; achievements: string }) => request<{ details_markdown: string; profile_markdown: string }>('/profile/generate', { method: 'POST', body: JSON.stringify(payload) }, token),
   profile: (token: string) => request<{ markdown: string | null }>('/profile', {}, token),
   saveProfile: (token: string, markdown: string) => request<{ message: string }>('/profile', { method: 'PUT', body: JSON.stringify({ markdown }) }, token),
+  linkedinCredentials: (token: string) => request<LinkedInCredentials>('/profile/linkedin', {}, token),
+  saveLinkedinCredentials: (token: string, payload: { email: string; password?: string | null }) => request<LinkedInCredentials>('/profile/linkedin', { method: 'PUT', body: JSON.stringify(payload) }, token),
+  linkedinSession: (token: string) => request<LinkedInSession>('/linkedin/session', {}, token),
+  connectLinkedin: (token: string) => request<LinkedInSession>('/linkedin/session/connect', { method: 'POST' }, token),
+  disconnectLinkedin: (token: string) => request<LinkedInSession>('/linkedin/session/disconnect', { method: 'POST' }, token),
+  indeedCredentials: (token: string) => request<IndeedCredentials>('/profile/indeed', {}, token),
+  saveIndeedCredentials: (token: string, payload: { email: string }) => request<IndeedCredentials>('/profile/indeed', { method: 'PUT', body: JSON.stringify(payload) }, token),
+  indeedSession: (token: string) => request<IndeedSession>('/indeed/session', {}, token),
+  connectIndeed: (token: string) => request<IndeedSession>('/indeed/session/connect', { method: 'POST' }, token),
+  disconnectIndeed: (token: string) => request<IndeedSession>('/indeed/session/disconnect', { method: 'POST' }, token),
   searchJobs: (token: string, payload: Record<string, unknown>) => request<{ run_id: number; accepted_jobs: Job[]; rejected_jobs: Job[]; fetched_count: number; saved_count: number }>('/jobs/scrape', { method: 'POST', body: JSON.stringify(payload) }, token),
   jobs: (token: string) => request<Job[]>('/jobs', {}, token),
+  applyJobs: (token: string, payload: { job_ids: number[]; resume_key?: string | null }) => request<ApplicationQueueResponse>('/applications/apply', { method: 'POST', body: JSON.stringify(payload) }, token),
+  applications: (token: string) => request<Application[]>('/applications', {}, token),
+  fillApplicationFields: (token: string, applicationId: number, values: Record<string, string>, remember: boolean) => request<Application>(`/applications/${applicationId}/fields`, { method: 'POST', body: JSON.stringify({ values, remember }) }, token),
+  continueApplication: (token: string, applicationId: number) => request<Application>(`/applications/${applicationId}/continue`, { method: 'POST' }, token),
+  setApplicationStatus: (token: string, applicationId: number, status: ManualStatus, reason?: string) => request<Application>(`/applications/${applicationId}/status`, { method: 'POST', body: JSON.stringify({ status, reason }) }, token),
+  submitApplication: (token: string, applicationId: number) => request<Application>(`/applications/${applicationId}/submit`, { method: 'POST' }, token),
+  agentPrompts: (token: string) => request<AgentPrompt[]>('/agent-config/prompts', {}, token),
+  saveAgentPrompt: (token: string, key: string, content: string) => request<AgentPrompt[]>(`/agent-config/prompts/${key}`, { method: 'PUT', body: JSON.stringify({ content }) }, token),
+  resetAgentPrompt: (token: string, key: string) => request<AgentPrompt[]>(`/agent-config/prompts/${key}`, { method: 'DELETE' }, token),
+  applicationEvents: (token: string, applicationId: number) => request<AgentEventsResponse>(`/applications/${applicationId}/events`, {}, token),
+  applicationSocketUrl,
   agentConfig: (token: string) => request<AgentConfig>('/agent-config', {}, token),
   saveAgentConfig: (token: string, model: string) => request<AgentConfig>('/agent-config', { method: 'PUT', body: JSON.stringify({ match_scoring: { model } }) }, token),
   saveSystemPrompt: (token: string, content: string) => request<AgentConfig>('/agent-config/system-prompt', { method: 'PUT', body: JSON.stringify({ content }) }, token),

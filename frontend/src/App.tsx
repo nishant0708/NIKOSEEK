@@ -5,7 +5,10 @@ import { AppNavbar } from './components/layout/AppNavbar';
 import { Button } from './components/ui/button';
 import { Input } from './components/ui/input';
 import { api, type User } from './lib/api';
+import { ConnectLinkedIn } from './pages/ConnectLinkedIn';
+import { ConnectIndeed } from './pages/ConnectIndeed';
 import { JobSearch } from './pages/JobSearch';
+import { LiveWorkflow } from './pages/LiveWorkflow';
 import { ProfileReview } from './pages/ProfileReview';
 import { ResumeOnboarding } from './pages/ResumeOnboarding';
 import { Workflow } from './pages/Workflow';
@@ -21,13 +24,17 @@ function AppRoutes() {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('jobflow_token'));
   const [user, setUser] = useState<User | null>(null);
   const [checking, setChecking] = useState(Boolean(token));
+  // Provider connections are checked for the selected jobs when they are queued.
+  const [, setLinkedinReady] = useState(false);
 
   useEffect(() => {
     if (!token) { setChecking(false); return; }
     setChecking(true);
-    Promise.all([api.me(token), api.resumeStatus(token), api.profile(token)])
-      .then(([me, resume, profile]) => {
+    Promise.all([api.me(token), api.resumeStatus(token), api.profile(token), api.linkedinSession(token).catch(() => null)])
+      .then(([me, resume, profile, linkedin]) => {
         setUser(me);
+        const ready = linkedin?.status === 'READY';
+        setLinkedinReady(ready);
         if (!resume.has_resume || !profile.markdown) navigate('/onboarding', { replace: true });
       })
       .catch(() => { localStorage.removeItem('jobflow_token'); setToken(null); setUser(null); navigate('/', { replace: true }); })
@@ -48,7 +55,10 @@ function AppRoutes() {
   return <><AppNavbar user={user} onLogout={logout} /><Routes>
     <Route path="/" element={<JobSearch token={token} />} />
     <Route path="/workflow" element={<Workflow token={token} />} />
-    <Route path="/profile" element={<ProfileReview token={token} onDone={() => navigate('/')} />} />
+    <Route path="/workflow/live" element={<LiveWorkflow token={token} />} />
+    <Route path="/connect-linkedin" element={<ConnectLinkedIn token={token} onConnected={() => { setLinkedinReady(true); navigate('/'); }} />} />
+    <Route path="/connect-indeed" element={<ConnectIndeed token={token} onConnected={() => navigate('/')} />} />
+    <Route path="/profile" element={<ProfileReview token={token} onDone={() => navigate('/')} onLinkedinChange={setLinkedinReady} />} />
     <Route path="/onboarding" element={<ResumeOnboarding token={token} onDone={() => navigate('/profile')} />} />
     <Route path="*" element={<Navigate to="/" replace />} />
   </Routes></>;
