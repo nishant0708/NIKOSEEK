@@ -81,3 +81,43 @@ def get_linkedin_login(user: User) -> tuple[str, str]:
     if not isinstance(encrypted, str) or not encrypted:
         raise ValueError("Add your LinkedIn password on the Profile page before applying.")
     return email.strip(), decrypt_secret(encrypted)
+
+
+# Keep Indeed credentials and session data in a separate namespace so neither
+# provider can overwrite or read the other's login details.
+def _indeed_config(user: User) -> dict:
+    config = user.agent_config or {}
+    indeed = config.get("indeed")
+    return dict(indeed) if isinstance(indeed, dict) else {}
+
+
+def indeed_public_payload(user: User) -> dict[str, str | bool]:
+    indeed = _indeed_config(user)
+    email = indeed.get("email")
+    return {
+        "email": email.strip() if isinstance(email, str) else "",
+        "password_set": bool(indeed.get("password_hash") or indeed.get("password_encrypted")),
+    }
+
+
+def set_indeed_credentials(user: User, email: str, password: str | None) -> None:
+    config = dict(user.agent_config or {})
+    indeed = _indeed_config(user)
+    indeed["email"] = email.strip()
+    if password:
+        indeed["password_hash"] = hash_password(password)
+        indeed["password_encrypted"] = encrypt_secret(password)
+    config["indeed"] = indeed
+    user.agent_config = config
+    flag_modified(user, "agent_config")
+
+
+def get_indeed_login(user: User) -> tuple[str, str]:
+    indeed = _indeed_config(user)
+    email = indeed.get("email")
+    encrypted = indeed.get("password_encrypted")
+    if not isinstance(email, str) or not email.strip():
+        raise ValueError("Add your Indeed email on the Profile page before applying.")
+    if not isinstance(encrypted, str) or not encrypted:
+        raise ValueError("Add your Indeed password on the Profile page before applying.")
+    return email.strip(), decrypt_secret(encrypted)

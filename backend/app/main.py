@@ -5,7 +5,7 @@ import time
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import agent_config, applications, auth, jobs, linkedin, profile, resumes
+from app.api.routes import agent_config, applications, auth, indeed, jobs, linkedin, profile, resumes
 from app.core.config import settings
 from app.core.logging import configure_logging
 from app.db.base import Base
@@ -30,6 +30,7 @@ app.include_router(jobs.router, prefix="/api/v1")
 app.include_router(applications.router, prefix="/api/v1")
 app.include_router(agent_config.router, prefix="/api/v1")
 app.include_router(linkedin.router, prefix="/api/v1")
+app.include_router(indeed.router, prefix="/api/v1")
 
 
 @app.middleware("http")
@@ -51,7 +52,7 @@ async def startup() -> None:
     Base.metadata.create_all(bind=engine)
     app.state.application_queue = asyncio.Queue()
     app.state.application_worker = asyncio.create_task(application_worker())
-    logger.info("Backend started; logs are written to backend/logs/backend.log")
+    logger.info("Backend started with event loop %s; logs are written to backend/logs/backend.log", type(asyncio.get_running_loop()).__name__)
 
 
 @app.on_event("shutdown")
@@ -60,8 +61,10 @@ async def shutdown() -> None:
     if worker is not None:
         worker.cancel()
     from app.services.linkedin_browser import linkedin_browser
+    from app.services.indeed_browser import indeed_browser
 
     await linkedin_browser.shutdown()
+    await indeed_browser.shutdown()
 
 
 async def application_worker() -> None:

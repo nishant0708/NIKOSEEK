@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from 'react';
 import { ArrowRight, CheckCircle, ExternalLink, Eye, KeyRound, LoaderCircle, LogOut, PencilLine } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
-import { api, type LinkedInSession } from '../lib/api';
+import { api, type IndeedSession, type LinkedInSession } from '../lib/api';
 
 function InlineMarkdown({ value }: { value: string }) {
   return <>{value.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).map((part, index) => {
@@ -13,7 +13,7 @@ function InlineMarkdown({ value }: { value: string }) {
 }
 
 function MarkdownPreview({ markdown }: { markdown: string }) {
-  return <div className="min-h-[420px] overflow-auto rounded-2xl border border-[#E8C9A4] bg-[#FFFDF8] p-5 text-sm leading-relaxed text-[#4E2B19]">
+  return <div className="h-[420px] min-h-[240px] max-h-[75vh] resize-y overflow-auto rounded-2xl border border-[#E8C9A4] bg-[#FFFDF8] p-5 text-sm leading-relaxed text-[#4E2B19]" aria-label="Markdown preview">
     {markdown.split('\n').map((line, index) => {
       if (line.startsWith('### ')) return <h3 key={index} className="mt-5 text-base font-black first:mt-0"><InlineMarkdown value={line.slice(4)} /></h3>;
       if (line.startsWith('## ')) return <h2 key={index} className="mt-6 text-xl font-black first:mt-0"><InlineMarkdown value={line.slice(3)} /></h2>;
@@ -22,6 +22,35 @@ function MarkdownPreview({ markdown }: { markdown: string }) {
       if (!line.trim()) return <div key={index} className="h-3" />;
       return <p key={index}><InlineMarkdown value={line} /></p>;
     })}
+  </div>;
+}
+
+function IndeedLogin({ token }: { token: string }) {
+  const [email, setEmail] = useState('');
+  const [session, setSession] = useState<IndeedSession | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState('');
+  const poll = useRef<number | null>(null);
+  const applySession = (next: IndeedSession) => { setSession(next); if (next.status !== 'LOGIN_IN_PROGRESS' && poll.current) { window.clearInterval(poll.current); poll.current = null; } };
+  const startPolling = () => { if (poll.current) window.clearInterval(poll.current); poll.current = window.setInterval(() => { api.indeedSession(token).then(applySession).catch(() => undefined); }, 2000); };
+  useEffect(() => {
+    Promise.all([api.indeedSession(token), api.indeedCredentials(token)]).then(([next, credentials]) => { applySession(next); setEmail(credentials.email); if (next.status === 'LOGIN_IN_PROGRESS') startPolling(); }).catch(() => undefined);
+    return () => { if (poll.current) window.clearInterval(poll.current); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token]);
+  async function connect() { setBusy(true); setMessage(''); try { applySession(await api.connectIndeed(token)); startPolling(); } catch (e) { setMessage(e instanceof Error ? e.message : 'Could not open the Indeed window.'); } finally { setBusy(false); } }
+  async function disconnect() { setBusy(true); setMessage(''); try { applySession(await api.disconnectIndeed(token)); setMessage('Indeed disconnected.'); } catch (e) { setMessage(e instanceof Error ? e.message : 'Could not disconnect Indeed.'); } finally { setBusy(false); } }
+  async function save() { setBusy(true); setMessage(''); try { const result = await api.saveIndeedCredentials(token, { email }); setEmail(result.email); setMessage('Indeed email saved.'); } catch (e) { setMessage(e instanceof Error ? e.message : 'Could not save Indeed email.'); } finally { setBusy(false); } }
+  const status = session?.status;
+  return <div className="mt-5 rounded-[1.75rem] border border-[#E8C9A4] bg-[#FFFDF8] p-5"><div className="flex items-center gap-2"><KeyRound className="text-orange" size={18} /><h2 className="text-xl font-black">Indeed login</h2></div>
+    <div className={`mt-4 flex flex-wrap items-center gap-3 rounded-2xl px-4 py-3 text-sm font-bold ${status === 'READY' ? 'bg-[#E3F7D9] text-[#347233]' : status === 'LOGIN_IN_PROGRESS' ? 'bg-[#FFF0DE] text-[#92502A]' : 'bg-[#FFE1D6] text-[#AD3212]'}`}>
+      {status === 'READY' ? <CheckCircle size={18} /> : status === 'LOGIN_IN_PROGRESS' ? <LoaderCircle className="animate-spin" size={18} /> : <KeyRound size={18} />}<span className="flex-1">{status === 'READY' ? <>Indeed connected{session?.last_login_at ? <span className="font-normal"> · since {new Date(session.last_login_at).toLocaleString()}</span> : null}</> : status === 'LOGIN_IN_PROGRESS' ? 'Waiting for you to finish signing in in the Indeed window…' : 'Indeed is not connected — connect before applying to Indeed jobs.'}</span>
+      {status === 'READY' ? <Button type="button" size="sm" variant="secondary" onClick={disconnect} disabled={busy}><LogOut size={14} /> Disconnect</Button> : <Button type="button" size="sm" onClick={connect} disabled={busy || status === 'LOGIN_IN_PROGRESS'}>{busy || status === 'LOGIN_IN_PROGRESS' ? <LoaderCircle className="animate-spin" size={14} /> : <ExternalLink size={14} />} Open Indeed test window</Button>}
+    </div>
+    <p className="mt-3 text-sm text-[#805940]">Save the email used by your Indeed account. We’ll use it to find the account, then you approve sign-in with your passkey in the browser prompt.</p>
+    <div className="mt-4 max-w-md"><label className="block text-sm font-bold">Indeed email<Input className="mt-2 bg-white" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@email.com" autoComplete="username" /></label></div>
+    <div className="mt-4 flex flex-wrap gap-2"><Button type="button" onClick={save} disabled={busy || !email}>{busy ? <LoaderCircle className="animate-spin" size={16} /> : null}Save Indeed email</Button></div>
+    {session?.error && status === 'NEEDS_LOGIN' && <p className="mt-2 text-xs font-bold text-[#AD3212]">{session.error}</p>}{message && <p className="mt-3 text-sm font-bold text-[#805940]">{message}</p>}
   </div>;
 }
 
@@ -126,7 +155,7 @@ export function ProfileReview({ token, onDone, onLinkedinChange }: { token: stri
         <div className="mt-7 grid gap-5 lg:grid-cols-2">
           <div>
             <div className="mb-2 flex items-center gap-2 text-xs font-black uppercase tracking-[.14em] text-[#895B3E]"><PencilLine size={14} /> Markdown editor</div>
-            <textarea value={markdown} onChange={e => setMarkdown(e.target.value)} disabled={busy} spellCheck={false} className="min-h-[420px] w-full rounded-2xl border border-[#E8C9A4] bg-[#FFFDF8] p-5 font-mono text-sm leading-relaxed outline-none focus:border-orange disabled:cursor-not-allowed" />
+            <textarea value={markdown} onChange={e => setMarkdown(e.target.value)} disabled={busy} spellCheck={false} className="h-[420px] min-h-[240px] max-h-[75vh] w-full resize-y overflow-auto rounded-2xl border border-[#E8C9A4] bg-[#FFFDF8] p-5 font-mono text-sm leading-relaxed outline-none focus:border-orange disabled:cursor-not-allowed" />
           </div>
           <div>
             <div className="mb-2 flex items-center gap-2 text-xs font-black uppercase tracking-[.14em] text-[#895B3E]"><Eye size={14} /> Live preview</div>
@@ -191,6 +220,7 @@ export function ProfileReview({ token, onDone, onLinkedinChange }: { token: stri
             </Button>
           </div>
         </div>
+        <IndeedLogin token={token} />
         {notice && <p className="mt-4 rounded-xl bg-[#E3F7D9] p-3 font-bold text-[#347233]">{notice}</p>}
         {error && <p className="mt-4 rounded-xl bg-[#FFE1D6] p-3 font-bold text-[#AD3212]">{error}</p>}
         <Button size="lg" className="mt-6 w-full" onClick={save} disabled={busy}>{busy ? <LoaderCircle className="animate-spin" /> : <>Save profile & find jobs <ArrowRight size={18} /></>}</Button>

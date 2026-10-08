@@ -3,7 +3,7 @@ import { CheckSquare, ExternalLink, LoaderCircle, Search, Square, BriefcaseBusin
 import { useNavigate } from 'react-router-dom';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
-import { api, LINKEDIN_NOT_CONNECTED, type Job } from '../lib/api';
+import { api, INDEED_NOT_CONNECTED, LINKEDIN_NOT_CONNECTED, type Job } from '../lib/api';
 
 function jobKey(job: Job) {
   return String(job.id ?? job.external_url);
@@ -73,6 +73,7 @@ export function JobSearch({ token }: { token: string }) {
   const [term, setTerm] = useState('');
   const [source, setSource] = useState('linkedin');
   const [location, setLocation] = useState('India');
+  const [indeedCountry, setIndeedCountry] = useState('India');
   const [experience, setExperience] = useState('0-1 years');
   const [salary, setSalary] = useState('');
   const [wanted, setWanted] = useState('10');
@@ -108,6 +109,7 @@ export function JobSearch({ token }: { token: string }) {
         sources: [source],
         search_term: term,
         location,
+        country_indeed: source === 'indeed' ? indeedCountry : null,
         experience,
         min_salary_lpa: salary ? Number(salary) : null,
         target_relevant_count: Number(wanted),
@@ -154,6 +156,10 @@ export function JobSearch({ token }: { token: string }) {
         navigate('/connect-linkedin');
         return;
       }
+      if (e instanceof Error && e.message === INDEED_NOT_CONNECTED) {
+        navigate('/connect-indeed');
+        return;
+      }
       setError(e instanceof Error ? e.message : 'Could not queue the selected jobs.');
     } finally {
       setApplyBusy(false);
@@ -172,6 +178,7 @@ export function JobSearch({ token }: { token: string }) {
             <option value="indeed">Indeed</option>
           </select>
           <Input value={location} onChange={e => setLocation(e.target.value)} placeholder="Location" />
+          {source === 'indeed' && <Input required value={indeedCountry} onChange={e => setIndeedCountry(e.target.value)} placeholder="Indeed country, e.g. India" />}
           <Input value={experience} onChange={e => setExperience(e.target.value)} placeholder="Experience, e.g. 0-1 years" />
           <Input type="number" value={salary} onChange={e => setSalary(e.target.value)} placeholder="Expected salary (LPA)" />
           <Input type="number" min="1" max="50" value={wanted} onChange={e => setWanted(e.target.value)} placeholder="Relevant jobs wanted" />

@@ -40,6 +40,11 @@ from app.services.linkedin_browser import (
     get_browser_session,
     linkedin_browser,
 )
+from app.services.indeed_browser import (
+    SOURCE as INDEED,
+    IndeedAuthRequired,
+    indeed_browser,
+)
 from app.services.storage import list_resumes
 from app.ws.broker import broker
 
@@ -120,6 +125,20 @@ def choose_resume(username: str, requested_key: str | None) -> tuple[str, str | 
 
 def linkedin_connected(db: Session, user: User) -> bool:
     return get_browser_session(db, user, LINKEDIN).status == READY
+
+
+def application_connection_error(db: Session, user: User, job_ids: list[int]) -> str | None:
+    """Return the provider-specific login requirement for the selected jobs."""
+    sources = {
+        source.lower()
+        for (source,) in db.query(ScrapedJob.source)
+        .filter(ScrapedJob.user_id == user.id, ScrapedJob.id.in_(job_ids)).all()
+    }
+    if LINKEDIN in sources and not linkedin_connected(db, user):
+        return "LINKEDIN_NOT_CONNECTED"
+    if INDEED in sources and get_browser_session(db, user, INDEED).status != READY:
+        return "INDEED_NOT_CONNECTED"
+    return None
 
 
 def enqueue_applications(db: Session, user: User, job_ids: list[int], resume_key: str | None) -> list[Application]:
@@ -206,31 +225,35 @@ def _review_stage(snap: dict) -> str:
 
 async def _run_pipeline(run: _Run, user: User) -> None:
     application, job, db, log = run.application, run.application.job, run.db, run.log
-    browser_session = get_browser_session(db, user, LINKEDIN)
+    source = job.source.lower()
+    if source == INDEED:
+        browser, provider = indeed_browser, "Indeed"
+    else:
+        browser, provider = linkedin_browser, "LinkedIn"
+    browser_session = get_browser_session(db, user, source)
     job_url = normalize_job_url(job.external_url)
     await form_sessions.close(application.id)  # a retry replaces any old open form
 
-    # 1. Open the posting in a new tab of the user's LinkedIn window.
+    # 1. Open the posting in a new tab of the selected provider's window.
     await run.stage("open", STAGE_OPENING, status="IN_PROGRESS")
-    context = await linkedin_browser.get_context(user.id, browser_session.auth_state)
+    context = await browser.get_context(user.id, browser_session.auth_state)
     page = await context.new_page()  # always a fresh tab owned by THIS application
     await page.bring_to_front()
     await page.goto(job_url, wait_until="domcontentloaded", timeout=60000)
     await log("action", f"Opened {page.url}", data={"url": page.url, "job_url": job_url})
 
-    # 2. Make sure we are a LinkedIn member (login happens in this same window if needed).
+    # 2. Make sure the selected provider session is active in this same window.
     async def relogin(target_page) -> None:
         async def on_wait() -> None:
             await run.publish(stage=STAGE_LOGIN_WAIT)
-            await log("warning", "LinkedIn is not signed in. Finish logging in in the browser window (2FA / verify-it's-you included).", stage_key="login")
-        await linkedin_browser.ensure_logged_in(db, user, target_page, on_wait=on_wait)
-        await log("info", "LinkedIn session is active.", stage_key="login")
+            await log("warning", f"{provider} is not signed in. Finish logging in in the browser window (2FA / verify-it's-you included).", stage_key="login")
+        await browser.ensure_logged_in(db, user, target_page, on_wait=on_wait)
+        await log("info", f"{provider} session is active.", stage_key="login")
 
-    if job.source.lower() == LINKEDIN:
-        await run.stage("login", STAGE_LOGIN_CHECK)
-        await relogin(page)
-        if not page.is_closed() and "/jobs/view/" not in page.url:
-            await page.goto(job_url, wait_until="domcontentloaded", timeout=60000)
+    await run.stage("login", STAGE_LOGIN_CHECK)
+    await relogin(page)
+    if source == LINKEDIN and not page.is_closed() and "/jobs/view/" not in page.url:
+        await page.goto(job_url, wait_until="domcontentloaded", timeout=60000)
 
     # 3. Reach the form: Easy Apply dialog or the company's site (AI-guided, wrong-tab guarded).
     await run.stage("find", STAGE_FINDING)
@@ -277,15 +300,16 @@ async def process_application(application_id: int, session_factory, user_id: int
             running_tasks[application_id] = task
         try:
             # One run at a time per user browser (also blocks while the Connect popup is open).
-            async with linkedin_browser.lock_for(user_id):
+            browser = indeed_browser if application.job.source.lower() == INDEED else linkedin_browser
+            async with browser.lock_for(user_id):
                 await _run_pipeline(run, application.user)
         except asyncio.CancelledError:
             # Stopped from the UI ("Move to failed"). The status was already set by set_application_status.
             logger.info("Application %s run was stopped by the user", application_id)
             db.rollback()
         except Exception as exc:
-            if isinstance(exc, LinkedInAuthRequired):
-                logger.warning("Application %s needs LinkedIn login: %s", application_id, exc)
+            if isinstance(exc, (LinkedInAuthRequired, IndeedAuthRequired)):
+                logger.warning("Application %s needs provider login: %s", application_id, exc)
             else:
                 logger.exception("Application %s failed", application_id)
             db.rollback()

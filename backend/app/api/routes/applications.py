@@ -12,7 +12,7 @@ from app.db.models import Application, User
 from app.schemas.applications import ApplicationFieldValues, ApplicationStatusUpdate, ApplicationQueueRequest, ApplicationQueueResponse, ApplicationRead
 from app.services.agent_log import list_events, serialize_event
 from app.services.applications import (
-    FormActionError, continue_form, enqueue_applications, fill_from_user, linkedin_connected, serialize_application, set_application_status, submit_form,
+    FormActionError, application_connection_error, continue_form, enqueue_applications, fill_from_user, serialize_application, set_application_status, submit_form,
 )
 from app.db.session import SessionLocal
 from app.ws.broker import broker
@@ -94,9 +94,9 @@ async def update_application_status(application_id: int, payload: ApplicationSta
 
 @router.post("/apply", response_model=ApplicationQueueResponse)
 async def apply_jobs(payload: ApplicationQueueRequest, user: CurrentUser, db: DbSession, request: Request) -> ApplicationQueueResponse:
-    if not linkedin_connected(db, user):
-        # Mandatory: the worker drives the user's signed-in LinkedIn window, so connect it first.
-        raise HTTPException(status_code=status.HTTP_428_PRECONDITION_REQUIRED, detail="LINKEDIN_NOT_CONNECTED")
+    connection_error = application_connection_error(db, user, payload.job_ids)
+    if connection_error:
+        raise HTTPException(status_code=status.HTTP_428_PRECONDITION_REQUIRED, detail=connection_error)
     try:
         applications = enqueue_applications(db, user, payload.job_ids, payload.resume_key)
     except ValueError as exc:
