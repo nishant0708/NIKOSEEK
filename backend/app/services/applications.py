@@ -29,8 +29,10 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.models import Application, ScrapedJob, User
+from app.services.agent_assist import questions
 from app.services.agent_log import AgentLog
-from app.services.form_filler import remember_answers
+from app.services.live_view import live_view
+from app.services.form_filler import remember_answers, remember_notes
 from app.services.form_session import FormSession, form_sessions
 from app.services.job_navigator import navigate_to_form, normalize_job_url
 from app.services.linkedin_browser import (
@@ -52,8 +54,9 @@ logger = logging.getLogger(__name__)
 
 # Stage labels — LiveWorkflow.tsx maps these (by substring) onto its flow nodes.
 STAGE_OPENING = "Opening job page"
-STAGE_LOGIN_CHECK = "Checking LinkedIn login"
-STAGE_LOGIN_WAIT = "Waiting for LinkedIn login in the browser window"
+STAGE_LOGIN_CHECK = "Checking {provider} login"
+STAGE_LOGIN_WAIT = "Waiting for {provider} login in the browser window"
+STAGE_QUESTION = "Waiting for your answer — {question}"
 STAGE_FINDING = "Finding apply button"
 STAGE_FIELDS = "Filling the form"
 STAGE_NEEDS_INPUT = "Needs your input ({n} field(s))"
@@ -94,6 +97,7 @@ def serialize_application(application: Application) -> dict:
         "llm_output_tokens": application.llm_output_tokens or 0,
         "llm_total_tokens": application.llm_total_tokens or 0,
         "llm_calls": application.llm_calls or 0,
+        "pending_question": questions.pending(application.id),
         "job": {
             "id": job.id,
             "source": job.source,
@@ -195,6 +199,16 @@ class _Run:
         self.application = application
         self.broker = websocket_broker
         self.log = AgentLog(db, application, websocket_broker, continue_attempt=continue_attempt, stage_key="review" if continue_attempt else "open")
+        self._stage_before_question: str | None = None
+        self.log.on_question = self._on_question
+        self.log.on_question_closed = self._on_question_closed
+
+    async def _on_question(self, entry: dict) -> None:
+        self._stage_before_question = self.application.stage
+        await self.publish(stage=STAGE_QUESTION.format(question=entry["question"])[:100])
+
+    async def _on_question_closed(self) -> None:
+        await self.publish(stage=self._stage_before_question or STAGE_FINDING)
 
     async def publish(self, *, stage: str | None = None, status: str | None = None) -> None:
         if stage is not None:
@@ -240,17 +254,18 @@ async def _run_pipeline(run: _Run, user: User) -> None:
     page = await context.new_page()  # always a fresh tab owned by THIS application
     await page.bring_to_front()
     await page.goto(job_url, wait_until="domcontentloaded", timeout=60000)
+    log.track(page)
     await log("action", f"Opened {page.url}", data={"url": page.url, "job_url": job_url})
 
     # 2. Make sure the selected provider session is active in this same window.
     async def relogin(target_page) -> None:
         async def on_wait() -> None:
-            await run.publish(stage=STAGE_LOGIN_WAIT)
+            await run.publish(stage=STAGE_LOGIN_WAIT.format(provider=provider))
             await log("warning", f"{provider} is not signed in. Finish logging in in the browser window (2FA / verify-it's-you included).", stage_key="login")
         await browser.ensure_logged_in(db, user, target_page, on_wait=on_wait)
         await log("info", f"{provider} session is active.", stage_key="login")
 
-    await run.stage("login", STAGE_LOGIN_CHECK)
+    await run.stage("login", STAGE_LOGIN_CHECK.format(provider=provider))
     await relogin(page)
     if source == LINKEDIN and not page.is_closed() and "/jobs/view/" not in page.url:
         await page.goto(job_url, wait_until="domcontentloaded", timeout=60000)
@@ -400,7 +415,7 @@ async def fill_from_user(db: Session, user: User, application_id: int, values: d
             except Exception as exc:
                 await run.log("warning", f"Could not save answers to your details: {exc}")
         # Easy Apply: once this step is complete, keep going automatically.
-        if session.mode == "easy_apply" and not snap["missing_required"] and snap["has_next"]:
+        if session.stepped and not snap["missing_required"] and snap["has_next"]:
             snap = await session.next_step(user, application.job, run.log)
     return await _finish_action(db, application, run, snap)
 
@@ -409,7 +424,7 @@ async def continue_form(db: Session, user: User, application_id: int, websocket_
     application, session = _load(db, user, application_id)
     run = _Run(db, application, websocket_broker, continue_attempt=True)
     async with session.lock:
-        snap = await session.next_step(user, application.job, run.log) if session.mode == "easy_apply" else await session.autofill(user, application.job, run.log)
+        snap = await session.next_step(user, application.job, run.log) if session.stepped else await session.autofill(user, application.job, run.log)
     return await _finish_action(db, application, run, snap)
 
 
@@ -431,3 +446,45 @@ async def submit_form(db: Session, user: User, application_id: int, websocket_br
     result = await _finish_action(db, application, run, snap, status=SUBMITTED, stage=STAGE_SUBMITTED)
     await form_sessions.close(application_id)
     return result
+
+
+async def answer_question(db: Session, user: User, application_id: int, question_id: str, answer: dict) -> dict:
+    """Your reply to a question the agent asked while it was stuck (option button / instruction / done)."""
+    application = db.query(Application).options(joinedload(Application.job)).filter(
+        Application.id == application_id, Application.user_id == user.id).one_or_none()
+    if application is None:
+        raise FormActionError("Application not found", 404)
+    if not questions.answer(application_id, question_id, answer):
+        raise FormActionError("That question is no longer open — the agent may have moved on.", 409)
+    return serialize_application(application)
+
+
+async def instruct_form(db: Session, user: User, application_id: int, instruction: str, websocket_broker=broker) -> dict:
+    """Free-text instruction on an open form ("click Continue", "choose India as country")."""
+    application, session = _load(db, user, application_id)
+    run = _Run(db, application, websocket_broker, continue_attempt=True)
+    async with session.lock:
+        snap = await session.instruct(instruction, user, application.job, run.log)
+        try:
+            await asyncio.to_thread(remember_notes, user.username, [instruction])
+            await run.log("info", "Saved your instruction to your profile details, so future applications reuse it.")
+        except Exception as exc:
+            logger.warning("Could not save instruction notes: %s", exc)
+        if session.stepped and snap["has_next"]:
+            if not snap["missing_required"]:
+                snap = await session.autofill(user, application.job, run.log, snap)
+            elif all(f["value"] for f in snap["fields"]):
+                # Everything has an answer now (maybe in the wrong format): try Next — it auto-corrects rejected values once.
+                snap = await session.next_step(user, application.job, run.log)
+    return await _finish_action(db, application, run, snap)
+
+
+async def recheck_form(db: Session, user: User, application_id: int, websocket_broker=broker) -> dict:
+    """“Check with my profile”: re-validate all fields on the open step and fix mismatches (then keep going if complete)."""
+    application, session = _load(db, user, application_id)
+    run = _Run(db, application, websocket_broker, continue_attempt=True)
+    async with session.lock:
+        snap = await session.recheck(user, application.job, run.log)
+        if session.stepped and not snap["missing_required"] and snap["has_next"]:
+            snap = await session.autofill(user, application.job, run.log, snap)
+    return await _finish_action(db, application, run, snap)

@@ -36,6 +36,7 @@ class ApplicationRead(BaseModel):
     llm_output_tokens: int = 0
     llm_total_tokens: int = 0
     llm_calls: int = 0
+    pending_question: dict | None = None
     job: ApplicationJobRead
 
 
@@ -57,3 +58,23 @@ class ApplicationFieldValues(BaseModel):
 class ApplicationStatusUpdate(BaseModel):
     status: str = Field(pattern="^(FAILED|COMPLETED|REJECTED)$")
     reason: str | None = Field(default=None, max_length=500)
+
+
+class ApplicationAnswer(BaseModel):
+    question_id: str = Field(min_length=1, max_length=40)
+    option: int | None = None
+    instruction: str | None = Field(default=None, max_length=1000)
+    done: bool = False
+
+
+class ApplicationInstruction(BaseModel):
+    instruction: str = Field(min_length=2, max_length=1000)
+
+
+class BrowserInput(BaseModel):
+    kind: str = Field(pattern="^(click|type|key|scroll|back|reload|front)$")
+    x: float | None = Field(default=None, ge=0, le=1)
+    y: float | None = Field(default=None, ge=0, le=1)
+    text: str | None = Field(default=None, max_length=500)
+    key: str | None = Field(default=None, max_length=20)
+    dy: float | None = None

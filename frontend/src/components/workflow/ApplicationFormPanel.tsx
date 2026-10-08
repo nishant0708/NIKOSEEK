@@ -45,7 +45,7 @@ export function ApplicationFormPanel({ token, application, onUpdated }: { token:
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [remember, setRemember] = useState(true);
   const [onlyMissing, setOnlyMissing] = useState(true);
-  const [busy, setBusy] = useState<'fill' | 'continue' | 'submit' | null>(null);
+  const [busy, setBusy] = useState<'fill' | 'continue' | 'submit' | 'recheck' | null>(null);
   const [error, setError] = useState('');
   const [confirmSubmit, setConfirmSubmit] = useState(false);
 
@@ -71,7 +71,7 @@ export function ApplicationFormPanel({ token, application, onUpdated }: { token:
   const [showAnswers, setShowAnswers] = useState(finished);
   const locked = !sessionOpen || busy !== null;
 
-  async function run(kind: 'fill' | 'continue' | 'submit', action: () => Promise<Application>) {
+  async function run(kind: 'fill' | 'continue' | 'submit' | 'recheck', action: () => Promise<Application>) {
     setBusy(kind); setError('');
     try { onUpdated(await action()); }
     catch (e) { setError(e instanceof Error ? e.message : 'Something went wrong.'); }
@@ -85,7 +85,7 @@ export function ApplicationFormPanel({ token, application, onUpdated }: { token:
       <div className="flex flex-wrap items-center gap-2">
         <h3 className="flex items-center gap-2 text-lg font-black text-ink"><FileText size={18} className="text-orange" /> Application form</h3>
         <span className="rounded-full bg-[#FFE4C8] px-3 py-1 text-[11px] font-black uppercase tracking-[.12em] text-[#82512D]">
-          {form.mode === 'easy_apply' ? `LinkedIn Easy Apply · step ${form.step ?? 1}` : 'Company form'}
+          {form.mode === 'easy_apply' ? `LinkedIn Easy Apply · step ${form.step ?? 1}` : form.mode === 'indeed_apply' ? `Indeed Apply · step ${form.step ?? 1}` : 'Company form'}
         </span>
         {form.resume_uploaded && <span className="rounded-full bg-[#E3F7D9] px-3 py-1 text-[11px] font-bold text-[#347233]">Resume attached</span>}
         {finished && <span className="rounded-full bg-[#DDF4D5] px-3 py-1 text-[11px] font-black uppercase tracking-[.12em] text-[#347233]">{application.status.toLowerCase()}</span>}
@@ -131,6 +131,7 @@ export function ApplicationFormPanel({ token, application, onUpdated }: { token:
                     : <span className="rounded-full bg-[#FFE1D6] px-2 py-0.5 text-[10px] font-black text-[#AD3212]">Missing</span>}
               </div>
               <FieldControl field={field} value={draft[field.key] ?? ''} disabled={locked} onChange={value => setDraft(current => ({ ...current, [field.key]: value }))} />
+              {field.hint && field.hint !== field.error && <p className="mt-1 text-xs text-[#805940]">{field.hint}</p>}
               {field.error && <p className="mt-1 text-xs font-bold text-[#AD3212]">{field.error}</p>}
             </div>
           );
@@ -148,11 +149,11 @@ export function ApplicationFormPanel({ token, application, onUpdated }: { token:
           </button>
           {showAnswers && (
             <table className="mt-3 w-full text-left text-xs">
-              <thead><tr className="border-b border-[#EBCDAA] text-[#805940]">{form.mode === 'easy_apply' && <th className="py-1.5 pr-2">Step</th>}<th className="py-1.5 pr-2">Question</th><th className="py-1.5 pr-2">Answer</th><th className="py-1.5">By</th></tr></thead>
+              <thead><tr className="border-b border-[#EBCDAA] text-[#805940]">{(form.mode === 'easy_apply' || form.mode === 'indeed_apply') && <th className="py-1.5 pr-2">Step</th>}<th className="py-1.5 pr-2">Question</th><th className="py-1.5 pr-2">Answer</th><th className="py-1.5">By</th></tr></thead>
               <tbody>
                 {answers.map((answer, index) => (
                   <tr key={`${answer.step}-${answer.label}-${index}`} className="border-b border-[#EBCDAA]/50 align-top">
-                    {form.mode === 'easy_apply' && <td className="py-1.5 pr-2 text-[#805940]">{answer.step}</td>}
+                    {(form.mode === 'easy_apply' || form.mode === 'indeed_apply') && <td className="py-1.5 pr-2 text-[#805940]">{answer.step}</td>}
                     <td className="py-1.5 pr-2 font-bold text-[#542914]">{answer.label}</td>
                     <td className="break-all py-1.5 pr-2 text-[#542914]">{answer.value}</td>
                     <td className="py-1.5 text-[#805940]">{answer.source === 'ai' ? 'AI' : answer.source === 'user' ? 'You' : answer.source === 'prefilled' ? 'Prefilled' : '—'}</td>
@@ -170,6 +171,10 @@ export function ApplicationFormPanel({ token, application, onUpdated }: { token:
         <div className="mt-5 flex flex-wrap items-center gap-3">
           <Button type="button" onClick={() => run('fill', () => api.fillApplicationFields(token, application.id, changed, remember))} disabled={locked || !changedCount}>
             {busy === 'fill' ? <LoaderCircle className="animate-spin" size={16} /> : <PencilLine size={16} />} Fill in browser{changedCount ? ` (${changedCount})` : ''}
+          </Button>
+          <Button type="button" variant="secondary" onClick={() => run('recheck', () => api.recheckApplication(token, application.id))} disabled={locked}
+            title="The AI re-validates every field on this step against your profile, saved answers and notes, and fixes what doesn't match">
+            {busy === 'recheck' ? <LoaderCircle className="animate-spin" size={16} /> : <ListChecks size={16} />} Check with my profile
           </Button>
           {form.has_next && (
             <Button type="button" variant="secondary" onClick={() => run('continue', () => api.continueApplication(token, application.id))} disabled={locked || changedCount > 0 || missingRequired.length > 0}>

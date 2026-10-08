@@ -59,6 +59,16 @@ class AgentLog:
         self.meter = TokenMeter()
         current_meter.set(self.meter)
 
+    # Hooks set by the pipeline (applications._Run): publish a "waiting for your answer" stage etc.
+    on_question = None
+    on_question_closed = None
+
+    def track(self, page) -> None:
+        """Remember which tab the agent is on, for the live browser view."""
+        from app.services.live_view import live_view
+
+        live_view.set_page(self.application.id, page)
+
     def set_stage(self, stage_key: str) -> None:
         if stage_key in STAGE_KEYS:
             self.stage_key = stage_key
@@ -98,3 +108,10 @@ class AgentLog:
                 "kind": kind, "message": message, "data": data or {}, "created_at": None,
             }
         await self.broker.send_to_user(self.application.user_id, {"type": "application.event", "event": payload})
+        if usage:
+            app = self.application
+            await self.broker.send_to_user(app.user_id, {
+                "type": "application.tokens", "application_id": app.id,
+                "llm_input_tokens": app.llm_input_tokens or 0, "llm_output_tokens": app.llm_output_tokens or 0,
+                "llm_total_tokens": app.llm_total_tokens or 0, "llm_calls": app.llm_calls or 0,
+            })

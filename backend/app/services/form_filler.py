@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import tempfile
+from datetime import date
 from pathlib import Path
 
 from app.db.models import User
@@ -49,7 +50,8 @@ COLLECT_FIELDS_JS = r"""(scopeEl) => {
   const doc = scope.getRootNode ? scope.getRootNode() : document;
   const vis = el => !!el && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
   const clean = t => (t || '').replace(/\s+/g, ' ').trim();
-  scope.querySelectorAll('[data-fill-key]').forEach(e => { e.removeAttribute('data-fill-key'); e.removeAttribute('data-fill-option'); });
+  const deepAll = (root, sel) => { const out = [...root.querySelectorAll(sel)]; root.querySelectorAll('*').forEach(el => { if (el.shadowRoot) out.push(...deepAll(el.shadowRoot, sel)); }); return out; };
+  deepAll(scope, '[data-fill-key]').forEach(e => { e.removeAttribute('data-fill-key'); e.removeAttribute('data-fill-option'); });
 
   const labelOf = (node) => {
     const id = node.id || '';
@@ -74,17 +76,40 @@ COLLECT_FIELDS_JS = r"""(scopeEl) => {
     const head = box && box.querySelector('label:not([for]), .label, strong, span');
     return head ? clean(head.innerText).slice(0, 200) : '';
   };
+  const byIds = (node, attr) => (node.getAttribute(attr) || '').split(/\s+/).filter(Boolean)
+    .map(id => { const e = doc.getElementById ? doc.getElementById(id) : document.getElementById(id); return e ? clean(e.textContent) : ''; })
+    .filter(Boolean).join(' ').slice(0, 200);
+  // Helper / validation text linked to the input (LinkedIn: "Enter a decimal number larger than 0.0").
+  const hintOf = (node) => byIds(node, 'aria-describedby') || byIds(node, 'aria-errormessage');
   const errorOf = (node) => {
-    const box = node.closest('fieldset, .fb-dash-form-element, .jobs-easy-apply-form-element, [class*="question"], [class*="field"]') || node.parentElement;
-    const err = box && box.querySelector('.artdeco-inline-feedback--error, [class*="error"]:not(input), [role="alert"]');
-    const text = err ? clean(err.innerText) : '';
-    return text || (node.getAttribute('aria-invalid') === 'true' ? 'Invalid value' : '');
+    const invalid = node.getAttribute('aria-invalid') === 'true';
+    let text = invalid ? (byIds(node, 'aria-errormessage') || hintOf(node)) : '';
+    if (!text) {
+      const box = node.closest('fieldset, .fb-dash-form-element, .jobs-easy-apply-form-element, [class*="question"], [class*="field"]') || node.parentElement;
+      const err = box && box.querySelector('.artdeco-inline-feedback--error, [class*="error"]:not(input), [role="alert"]');
+      text = err ? clean(err.innerText || err.textContent) : '';
+    }
+    if (!text && node.validity && !node.validity.valid && !node.validity.valueMissing) text = node.validationMessage || '';
+    return text || (invalid ? 'Invalid value' : '');
+  };
+  // Visible text of one radio option. LinkedIn radios often have no value attribute (value="on"),
+  // so the option text must come from its label / aria / neighbouring text.
+  const optionText = (node, index) => {
+    const cands = [];
+    if (node.labels) for (const l of node.labels) { cands.push(l.innerText); cands.push(l.textContent); }
+    cands.push(node.getAttribute('aria-label'));
+    cands.push(byIds(node, 'aria-labelledby'));
+    if (node.nextElementSibling) cands.push(node.nextElementSibling.textContent);
+    if (node.parentElement && node.parentElement.querySelectorAll('input').length === 1) cands.push(node.parentElement.textContent);
+    for (const c of cands) { const t = clean(c); if (t && t.length <= 150) return t; }
+    const v = node.getAttribute('value');
+    return v && v !== 'on' ? v : `Option ${index + 1}`;
   };
   const isRequired = (node, label) => node.required || node.getAttribute('aria-required') === 'true' || /\*\s*$|\(required\)/i.test(label);
 
   const out = [];
   const radioGroups = new Map();
-  const nodes = [...scope.querySelectorAll('input, textarea, select')];
+  const nodes = deepAll(scope, 'input, textarea, select');
   for (const node of nodes) {
     const tag = node.tagName.toLowerCase();
     const type = (node.getAttribute('type') || (tag === 'input' ? 'text' : tag)).toLowerCase();
@@ -101,7 +126,8 @@ COLLECT_FIELDS_JS = r"""(scopeEl) => {
         radioGroups.set(name, group);
         out.push(group);
       }
-      const optLabel = (node.labels && node.labels[0] && clean(node.labels[0].innerText)) || node.value;
+      const optLabel = optionText(node, group.options.length);
+      if (node.required || node.getAttribute('aria-required') === 'true') group.required = true;
       node.setAttribute('data-fill-key', group.key);
       node.setAttribute('data-fill-option', String(group.options.length));
       group.options.push(optLabel);
@@ -115,7 +141,9 @@ COLLECT_FIELDS_JS = r"""(scopeEl) => {
     const field = {
       key, tag, type, name: node.getAttribute('name'), id: node.id || '',
       placeholder: node.getAttribute('placeholder'), autocomplete: node.getAttribute('autocomplete'),
-      label, required: isRequired(node, label), error: errorOf(node), options: null, value: '',
+      label, required: isRequired(node, label), error: errorOf(node), hint: hintOf(node), options: null, value: '',
+      inputmode: node.getAttribute('inputmode'), pattern: node.getAttribute('pattern'),
+      min: node.getAttribute('min'), max: node.getAttribute('max'), maxlength: node.getAttribute('maxlength'),
       kind: tag === 'select' ? 'select' : tag === 'textarea' ? 'textarea' : type === 'checkbox' ? 'checkbox'
         : (node.getAttribute('role') === 'combobox' || node.getAttribute('aria-autocomplete') === 'list' || node.closest('[class*="select__control"]')) ? 'combobox' : 'text',
     };
@@ -207,8 +235,21 @@ def _regex_answer(field: dict, answers: dict[str, str]) -> str | None:
 
 
 def _fields_for_llm(fields: list[dict]) -> list[dict]:
-    keep = ("key", "kind", "label", "name", "placeholder", "required", "options", "group")
-    return [{k: f.get(k) for k in keep if f.get(k) not in (None, "", [])} for f in fields]
+    keep = ("key", "kind", "label", "name", "placeholder", "required", "options", "group",
+            "type", "inputmode", "pattern", "min", "max", "maxlength", "hint", "error")
+    out = []
+    for f in fields:
+        item = {k: f.get(k) for k in keep if f.get(k) not in (None, "", [])}
+        if f.get("value"):
+            item["current_value"] = f["value"]
+        out.append(item)
+    return out
+
+
+# Prefilled choice fields are re-checked too: LinkedIn defaults "Phone country code" to the first option
+# (e.g. "Andorra (+376)"), which looks filled but is wrong.
+RECHECK_KINDS = ("select", "combobox", "radio")
+KEEP = "KEEP"
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +271,46 @@ async def resolve_root(frame, root: str | None):
             return candidate
         fallback = fallback or candidate
     return fallback
+
+
+async def find_root_in_page(page, root: str):
+    """Search the main frame AND every iframe for the visible `root` (e.g. the Easy Apply dialog).
+    Returns (frame, locator) or (None, None)."""
+    frames = [page.main_frame] + [f for f in page.frames if f is not page.main_frame]
+    for frame in frames:
+        try:
+            scope = await resolve_root(frame, root)
+        except Exception:
+            continue
+        if scope is not None:
+            return frame, scope
+    return None, None
+
+
+DIAGNOSE_JS = r"""() => {
+  const out = { dialogs: 0, visibleDialogs: 0, shadowHosts: 0, inputs: 0 };
+  const walk = (root) => {
+    root.querySelectorAll('*').forEach(el => {
+      if (el.tagName === 'DIALOG' || (el.getAttribute && el.getAttribute('role') === 'dialog')) { out.dialogs++; if (el.getClientRects().length) out.visibleDialogs++; }
+      if (/^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) out.inputs++;
+      if (el.shadowRoot) { out.shadowHosts++; walk(el.shadowRoot); }
+    });
+  };
+  walk(document);
+  return out;
+}"""
+
+
+async def diagnose_page(page) -> dict:
+    """Small DOM census per frame — attached to the agent log when a form/dialog can't be found."""
+    report = []
+    for frame in page.frames[:12]:
+        try:
+            counts = await frame.evaluate(DIAGNOSE_JS)
+        except Exception as exc:
+            counts = {"error": str(exc).splitlines()[0][:80]}
+        report.append({"url": (frame.url or "")[:120], **counts})
+    return {"frames": report}
 
 
 async def collect_fields(frame, root: str | None = None) -> list[dict]:
@@ -258,13 +339,27 @@ async def collect_fields(frame, root: str | None = None) -> list[dict]:
     return fields
 
 
-async def resolve_values(fields: list[dict], user: User, job) -> tuple[dict[str, str], str]:
-    """AI maps profile -> the EMPTY fields (prefilled ones are left alone). Unknowns are NOT guessed."""
-    empty = [f for f in fields if not f.get("value")]
+async def resolve_values(fields: list[dict], user: User, job, notes: list[str] | None = None, *, recheck_all: bool = False) -> tuple[dict[str, str], str]:
+    resolved, mode = await _resolve_values(fields, user, job, notes, recheck_all=recheck_all)
+    country = await asyncio.to_thread(profile_country, user.username, notes)
+    for field in fields:
+        fix = country_option(field, country)
+        if fix and field["key"] not in resolved:
+            resolved[field["key"]] = fix
+    return resolved, mode
+
+
+async def _resolve_values(fields: list[dict], user: User, job, notes: list[str] | None = None, *, recheck_all: bool = False) -> tuple[dict[str, str], str]:
+    """AI maps profile -> the EMPTY fields, and re-checks prefilled choice fields. Unknowns are NOT guessed."""
+    empty = fields if recheck_all else [f for f in fields if not f.get("value") or f.get("error") or f.get("kind") in RECHECK_KINDS]
     if not empty:
         return {}, "none"
     answers = await asyncio.to_thread(profile_answers, user.username)
     profile = await asyncio.to_thread(profile_text, user.username)
+    profile += f"\n\nToday's date: {date.today().isoformat()}"
+    if notes:
+        # Things you told the agent during this application ("immediate joiner, CTC 10 LPA ...").
+        profile += "\n\n## What the applicant told the agent for this application\n" + "\n".join(f"- {n}" for n in notes)
     prompt = render(user, "form_mapping", job_title=job.title or "", job_company=job.company or "",
                     profile=profile, fields=json.dumps(_fields_for_llm(empty), indent=2, ensure_ascii=False))
     try:
@@ -276,7 +371,7 @@ async def resolve_values(fields: list[dict], user: User, job) -> tuple[dict[str,
             if field is None or not isinstance(value, (str, int, float)):
                 continue
             value = str(value).strip()
-            if not value or value == ASK_USER:
+            if not value or value in (ASK_USER, KEEP) or value == (field.get("value") or "").strip():
                 continue
             if field.get("options") and field["kind"] in ("select", "radio", "checkbox"):
                 match = _match_option(field["options"], value)
@@ -294,6 +389,41 @@ async def resolve_values(fields: list[dict], user: User, job) -> tuple[dict[str,
                 if value:
                     resolved[field["key"]] = value
         return resolved, "regex"
+
+
+COUNTRIES = (
+    "India", "United States", "United Kingdom", "Canada", "Australia", "Germany", "France", "Netherlands", "Singapore",
+    "United Arab Emirates", "UAE", "Ireland", "Spain", "Italy", "Sweden", "Switzerland", "Japan", "Brazil", "Mexico",
+    "Poland", "Israel", "New Zealand", "South Africa", "Nepal", "Bangladesh", "Sri Lanka", "Pakistan", "Philippines", "Indonesia",
+)
+
+
+def profile_country(username: str, notes: list[str] | None = None) -> str | None:
+    """The applicant's country from the profile Location line (or notes); used to fix wrong default country pickers."""
+    text = f"{profile_text(username)}\n" + "\n".join(notes or [])
+    location = re.search(r"location\W{0,6}\s*(.+)", text, re.I)
+    for haystack in ([location.group(1)] if location else []) + [text]:
+        for country in COUNTRIES:
+            if re.search(rf"\b{re.escape(country)}\b", haystack, re.I):
+                return country
+    # Indian mobile numbers (+91 / 10 digits starting 6-9) as a last resort.
+    if re.search(r"\+91[\s-]?\d|(?<!\d)[6-9]\d{9}(?!\d)", text):
+        return "India"
+    return None
+
+
+def country_option(field: dict, country: str | None) -> str | None:
+    """For a country / phone-country-code picker whose current value is not the applicant's country, the right option."""
+    if not country or field.get("kind") not in ("select", "combobox") or not field.get("options"):
+        return None
+    if not re.search(r"country", field.get("label") or "", re.I):
+        return None
+    if country.lower() in (field.get("value") or "").lower():
+        return None
+    for option in field["options"]:
+        if re.search(rf"\b{re.escape(country)}\b", option, re.I):
+            return option
+    return None
 
 
 def _match_option(options: list[str], value: str) -> str | None:
@@ -408,5 +538,18 @@ def remember_answers(username: str, answers: list[tuple[str, str]]) -> None:
     if "## Application answers" not in details:
         details = details.rstrip() + "\n\n## Application answers\n"
     lines = "".join(f"- {label}: {value}\n" for label, value in answers if f"- {label}: " not in details)
+    if lines:
+        save_details_markdown(username, details.rstrip("\n") + "\n" + lines)
+
+
+def remember_notes(username: str, notes: list[str]) -> None:
+    """Keep what you told the agent in instructions ("immediate joiner, CTC 10 LPA") in details.md for future applications."""
+    notes = [n.strip() for n in notes if n and n.strip()]
+    if not notes:
+        return
+    details = read_details_markdown(username) or ""
+    if "## Notes I gave the agent" not in details:
+        details = details.rstrip() + "\n\n## Notes I gave the agent\n"
+    lines = "".join(f"- {note}\n" for note in notes if f"- {note}\n" not in details)
     if lines:
         save_details_markdown(username, details.rstrip("\n") + "\n" + lines)

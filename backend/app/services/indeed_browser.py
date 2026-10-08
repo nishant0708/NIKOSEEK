@@ -16,6 +16,8 @@ from app.db.models import BrowserSession, User
 from app.services.agent_config import indeed_public_payload
 from app.services.linkedin_browser import LOGIN_IN_PROGRESS, NEEDS_LOGIN, READY, get_browser_session, mark_browser_session
 
+from app.services.browser_common import WINDOW_ARGS
+
 logger = logging.getLogger(__name__)
 SOURCE = "indeed"
 PROFILE_ROOT = Path(__file__).resolve().parents[2] / ".browser_profiles"
@@ -123,7 +125,7 @@ class IndeedBrowserManager:
         profile_dir = PROFILE_ROOT / f"user_{user_id}" / SOURCE
         first_launch = not profile_dir.exists()
         profile_dir.mkdir(parents=True, exist_ok=True)
-        options = {"user_data_dir": str(profile_dir), "headless": False, "viewport": {"width": 1366, "height": 900}, "args": LAUNCH_ARGS, "ignore_default_args": ["--enable-automation"]}
+        options = {"user_data_dir": str(profile_dir), "headless": False, "no_viewport": True, "args": LAUNCH_ARGS + WINDOW_ARGS, "ignore_default_args": ["--enable-automation"]}
         try:
             context = await playwright.chromium.launch_persistent_context(channel="chrome", **options)
         except Exception:
@@ -206,8 +208,8 @@ class IndeedBrowserManager:
         return session
 
     async def shutdown(self) -> None:
-        for task in self._connect_tasks.values(): task.cancel()
-        for context in self._contexts.values():
+        for task in list(self._connect_tasks.values()): task.cancel()
+        for context in list(self._contexts.values()):
             try: await context.close()
             except Exception: pass
         self._contexts.clear()
