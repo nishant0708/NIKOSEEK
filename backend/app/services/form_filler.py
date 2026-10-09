@@ -35,6 +35,7 @@ FIELD_KEY_PATTERNS: list[tuple[tuple[str, ...], str]] = [
     (("last name", "lastname", "family-name", "surname", "family_name"), "last_name"),
     (("full name", "your name", "legal name"), "full_name"),
     (("email", "e-mail"), "email"),
+    (("notice period", "notice-period", "availability", "available to join"), "notice_period"),
     (("phone", "mobile", "tel"), "phone"),
     (("city",), "city"),
     (("country",), "country"),
@@ -208,6 +209,17 @@ def profile_answers(username: str) -> dict[str, str]:
     phone = re.search(r"(\+?\d[\d\s().-]{8,}\d)", text)
     if phone:
         answers["phone"] = re.sub(r"\s+", " ", phone.group(1)).strip()
+    notice = re.search(
+        r"(?:notice\s*period|available\s*to\s*join|availability)[^\n]*?"
+        r"(\d+(?:\.\d+)?)\s*(days?|weeks?|months?)",
+        text,
+        re.I,
+    )
+    if notice:
+        amount = float(notice.group(1))
+        unit = notice.group(2).lower()
+        days = amount * {"day": 1, "days": 1, "week": 7, "weeks": 7, "month": 30, "months": 30}[unit]
+        answers["notice_period"] = str(int(days)) if days.is_integer() else str(days)
     linkedin = re.search(r"https?://(?:www\.)?linkedin\.com/\S+", text, re.I)
     if linkedin:
         answers["linkedin"] = linkedin.group(0).rstrip(").,")
@@ -341,10 +353,33 @@ async def collect_fields(frame, root: str | None = None) -> list[dict]:
 
 async def resolve_values(fields: list[dict], user: User, job, notes: list[str] | None = None, *, recheck_all: bool = False) -> tuple[dict[str, str], str]:
     resolved, mode = await _resolve_values(fields, user, job, notes, recheck_all=recheck_all)
+    answers = await asyncio.to_thread(profile_answers, user.username)
+    for field in fields:
+        if re.search(r"notice\s*period|available\s*to\s*join|availability", field.get("label", ""), re.I):
+            if answers.get("notice_period"):
+                resolved[field["key"]] = answers["notice_period"]
+            else:
+                # Never infer a notice period from a generic model rule. Clear
+                # any browser-prefilled/model value so the applicant is asked.
+                resolved[field["key"]] = ""
     country = await asyncio.to_thread(profile_country, user.username, notes)
+    if not country:
+        # The phone field is often the only profile fact available to this
+        # form. Use it to validate LinkedIn's phone-country default.
+        profile_phone = re.sub(r"\D", "", answers.get("phone", ""))
+        if len(profile_phone) == 10 and profile_phone[0] in "6789":
+            country = "India"
+        for field in fields:
+            if re.search(r"mobile|phone|tel", field.get("label", ""), re.I):
+                digits = re.sub(r"\D", "", field.get("value") or "")
+                if len(digits) == 10 and digits[0] in "6789":
+                    country = "India"
+                    break
     for field in fields:
         fix = country_option(field, country)
-        if fix and field["key"] not in resolved:
+        # A model response must not preserve LinkedIn's arbitrary default (for
+        # example Andorra) when the profile identifies the applicant's country.
+        if fix:
             resolved[field["key"]] = fix
     return resolved, mode
 
@@ -412,18 +447,32 @@ def profile_country(username: str, notes: list[str] | None = None) -> str | None
     return None
 
 
+COUNTRY_DIAL_CODES = {
+    "India": "+91",
+    "United States": "+1",
+    "United Kingdom": "+44",
+    "Canada": "+1",
+    "Australia": "+61",
+}
+
+
 def country_option(field: dict, country: str | None) -> str | None:
     """For a country / phone-country-code picker whose current value is not the applicant's country, the right option."""
-    if not country or field.get("kind") not in ("select", "combobox") or not field.get("options"):
+    if not country:
         return None
-    if not re.search(r"country", field.get("label") or "", re.I):
+    label = field.get("label") or ""
+    if not re.search(r"country(?:\s+code)?|dial(?:ing)?\s+code", label, re.I):
         return None
     if country.lower() in (field.get("value") or "").lower():
         return None
-    for option in field["options"]:
-        if re.search(rf"\b{re.escape(country)}\b", option, re.I):
+    dial_code = COUNTRY_DIAL_CODES.get(country)
+    for option in field.get("options") or []:
+        if re.search(rf"\b{re.escape(country)}\b", option, re.I) or (dial_code and dial_code in option):
             return option
-    return None
+    # LinkedIn sometimes reports its custom country picker as a text control
+    # without exposing the menu options during collection. Its combobox
+    # handler can still search for the country name.
+    return country if field.get("kind") in ("text", "combobox", "select") else None
 
 
 def _match_option(options: list[str], value: str) -> str | None:
@@ -467,9 +516,35 @@ async def set_field_value(frame, field: dict, value: str) -> None:
         return
     if kind == "select":
         option = _match_option(field.get("options") or [], value) or value
-        await locator.select_option(label=option, timeout=5000)
+        try:
+            await locator.select_option(label=option, timeout=5000)
+        except Exception:
+            # Some LinkedIn selects expose options in the DOM but collection
+            # cannot read their labels through the shadow root. Select by
+            # visible text/dial code directly and verify the resulting value.
+            dial_code = COUNTRY_DIAL_CODES.get(value, "")
+            selected = await locator.evaluate(
+                """(select, target) => {
+                  const wanted = String(target.country || '').toLowerCase();
+                  const dial = String(target.dial || '');
+                  const option = [...select.options].find(item => {
+                    const text = (item.textContent || '').trim().toLowerCase();
+                    return (wanted && text.includes(wanted)) || (dial && text.includes(dial));
+                  });
+                  if (!option) return false;
+                  option.selected = true;
+                  select.dispatchEvent(new Event('input', { bubbles: true }));
+                  select.dispatchEvent(new Event('change', { bubbles: true }));
+                  return true;
+                }""",
+                {"country": value, "dial": dial_code},
+            )
+            if not selected:
+                raise ValueError(f"Could not select {value} in {field.get('label') or key}")
         return
-    if kind == "combobox" or field.get("id") == "location-input":
+    if kind == "combobox" or field.get("id") == "location-input" or re.search(
+        r"country(?:\s+code)?|dial(?:ing)?\s+code", field.get("label") or "", re.I
+    ):
         await locator.click(timeout=5000)
         await locator.fill("")
         await locator.press_sequentially(value, delay=60)
@@ -494,7 +569,7 @@ async def fill_fields(frame, fields: list[dict], values: dict[str, str]) -> tupl
     errors: dict[str, str] = {}
     for key, value in values.items():
         field = by_key.get(key)
-        if field is None or value is None or str(value).strip() == "":
+        if field is None or value is None:
             continue
         try:
             await set_field_value(frame, field, str(value))

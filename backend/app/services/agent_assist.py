@@ -92,7 +92,15 @@ async def run_instruction(session, frame, scope, instruction: str, user: User | 
             previous_answers=json.dumps([[a["step"], a["label"], a["value"]] for a in previous], ensure_ascii=False),
             done_so_far=json.dumps(done, ensure_ascii=False) if done else "nothing yet",
         )
-        plan = await generate_json_object(prompt)
+        try:
+            plan = await generate_json_object(prompt)
+        except ValueError as exc:
+            # Keep the open form usable when the model violates the JSON-object
+            # contract (for example by returning a JSON array).
+            message = "The AI returned an invalid instruction plan. Please retry or use the live browser controls."
+            failed.append(message)
+            await log("warning", message, data={"error": str(exc)[:200]})
+            break
         reply = str(plan.get("reply") or "").strip() or reply
         actions = [a for a in (plan.get("actions") or []) if isinstance(a, dict)][:MAX_ACTIONS]
         await log("thinking", f"Your instruction (round {round_no}): “{instruction[:120]}” → {reply or 'no reply'}",

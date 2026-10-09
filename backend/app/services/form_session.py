@@ -160,8 +160,13 @@ class FormSession:
                 "source": source, "group": f.get("group"), "hint": f.get("hint") or "",
             })
         for f in fields:  # remember every answer across steps (saved in form_data.answers)
+            label = f["label"]
             if f["value"]:
-                self.answers[f["label"]] = {"step": self.step, "label": f["label"], "value": f["value"], "source": f["source"], "kind": f["kind"]}
+                self.answers[label] = {"step": self.step, "label": label, "value": f["value"], "source": f["source"], "kind": f["kind"]}
+            elif self.answers.get(label, {}).get("step") == self.step:
+                # A recheck can clear a browser-prefilled or hallucinated value.
+                # Do not keep showing that stale value in the saved answers table.
+                self.answers.pop(label, None)
         missing = [f["key"] for f in fields if not f["value"]]
         missing_required = [
             f["key"] for f in fields
@@ -189,7 +194,9 @@ class FormSession:
         self.fields = await collect_fields(frame, self.root)
         await log("info", f"{self.flow_name} step {self.step}: found {len(self.fields)} fields." if self.stepped else f"Form: found {len(self.fields)} fields.",
                   data={"labels": [f.get("label") for f in self.fields][:40], "step": self.step})
-        values, self.mapping = await resolve_values(self.fields, user, job, self.notes)
+        # LinkedIn restores values from the user's browser profile. Treat those values as
+        # candidates too: they still need to be checked against the saved application profile.
+        values, self.mapping = await resolve_values(self.fields, user, job, self.notes, recheck_all=True)
         filled, errors = await fill_fields(frame, self.fields, values)
         self.ai_keys |= set(filled)
         self.last_errors = errors
@@ -203,7 +210,11 @@ class FormSession:
         snap = await self.refresh()
         asked = [f["label"] for f in snap["fields"] if not f["value"]]
         await log("thinking", f"AI filled {len(filled)} field(s) ({self.mapping}); {len(asked)} still empty ({len(snap['missing_required'])} required).",
-                  data={"filled": [f["label"] for f in snap["fields"] if f["key"] in filled], "needs_input": asked[:40]})
+                  data={
+                      "filled": [f["label"] for f in snap["fields"] if f["key"] in filled],
+                      "needs_input": asked[:40],
+                      "fill_errors": {f.get("label"): error for key, error in errors.items() for f in self.fields if f["key"] == key},
+                  })
         return snap
 
     async def autofill(self, user: User, job, log, snap: dict | None = None) -> dict:

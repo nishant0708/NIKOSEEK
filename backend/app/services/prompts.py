@@ -88,7 +88,7 @@ DERIVE answers that follow directly from those facts instead of asking:
 - "Years of experience with <skill>": add up the durations of roles/projects that use the skill (from the dates; today is the
   reference for "Present"), round DOWN to a whole number; if the skill is listed but per-role dates are unclear, use total
   professional experience. Answer digits only when the field is numeric.
-- Notice period: "immediate joiner" / "immediately" -> 0 days (or the "Immediate" option); "1 month" -> 30 days.
+- Notice period: copy only an explicit notice period from the profile or applicant notes. If it is not stated, return exactly "ASK_USER"; never infer 15/30/60 days.
 - CTC / salary: use the numbers the applicant stated (current vs expected — never swap them), in the unit the question asks.
 - Location / country / phone code / work authorization: from the profile location and earlier answers.
 CRITICAL: only if NOTHING in the profile, answers or notes supports a value (e.g. CTC never mentioned anywhere), return exactly "ASK_USER". Never invent.
