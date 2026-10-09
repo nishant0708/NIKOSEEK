@@ -30,18 +30,19 @@ function buildNodes(model: string): Node[] {
   return [
     node('find', 0, 0, '🔎 Find jobs', 'JobSpy scrapes LinkedIn / Indeed with your search.', 'find'),
     node('score', 300, 0, `🧮 Match scoring`, `${model || 'model'} + shared system prompt score each job 0–100.`, 'find'),
-    node('pick', 600, 0, '✅ Review & Apply selected', 'You pick jobs on the Jobs page. LinkedIn must be connected.', 'human'),
-    node('open', 600, 170, '🌐 Open posting', 'New tab in your signed-in LinkedIn window.', 'agent'),
-    node('login', 300, 170, '🔐 LinkedIn login check', 'Session expired? Log in in the same window.', 'agent'),
+    node('pick', 600, 0, '✅ Review & Apply selected', 'You pick jobs on the Jobs page. LinkedIn / Indeed must be connected.', 'human'),
+    node('open', 600, 170, '🌐 Open posting', 'New tab in your signed-in LinkedIn or Indeed window.', 'agent'),
+    node('login', 300, 170, '🔐 LinkedIn / Indeed login check', 'Session expired? Log in in the same window.', 'agent'),
     node('check1', 0, 170, '🧠 Correct-page check', 'AI confirms the tab is THIS job (wrong-tab guard).', 'prompt', 'page_verification'),
-    node('easy', 0, 340, '◆ Easy Apply?', 'Easy Apply button on the posting?', 'decision'),
-    node('ea', 0, 510, '📝 Easy Apply dialog', 'Fills each step, clicks Next / Review while nothing required is missing.', 'agent'),
-    node('nav', 300, 340, '🧠 Job navigation', 'AI picks Apply → company site → form. Stuck? asks you.', 'prompt', 'job_navigation'),
+    node('easy', 0, 340, '◆ Easy Apply / Indeed Apply?', 'Built-in apply flow on LinkedIn or Indeed?', 'decision'),
+    node('ea', 0, 510, '📝 Easy Apply / Indeed Apply', 'Fills each step, clicks Next / Continue while nothing required is missing.', 'agent'),
+    node('nav', 300, 340, '🧠 Job navigation', 'AI picks Apply → company site → form. Stuck? It asks you (buttons or your own instruction).', 'prompt', 'job_navigation'),
     node('check2', 600, 340, '🧠 Correct-page check', 'Form tab verified before anything is typed.', 'prompt', 'page_verification'),
     node('fill', 300, 510, '🧠 Form filling', 'Maps profile.md + details.md onto empty fields; unknown → ASK_USER. Attaches resume.', 'prompt', 'form_mapping'),
-    node('answers', 600, 510, '🙋 Your answers', 'Live Workflow: fill missing fields & dropdowns; answers saved to details.md.', 'human'),
+    node('answers', 600, 510, '🙋 Your answers', 'Live Workflow: fill missing fields & dropdowns, instruct the agent, or click in the live browser view.', 'human'),
     node('submit', 900, 510, '📨 Submit (you press it)', 'Only enabled when every required field is filled.', 'human'),
     node('statuses', 900, 680, '🏁 Statuses', 'Submitted · Completed · Rejected · Failed (manual moves from the queue).', 'status'),
+    node('assist', 300, 680, '🧠 Browser assistant', 'Turns your typed instructions into clicks / field fills.', 'prompt', 'browser_assistant'),
     node('log', 900, 170, '📜 Agent log + tokens', 'Every AI decision, action and token count is saved per attempt.', 'status'),
   ];
 }
@@ -57,7 +58,7 @@ const EDGES: Edge[] = [
   edge('find', 'score'), edge('score', 'pick'), edge('pick', 'open'), edge('open', 'login'), edge('login', 'check1'),
   edge('check1', 'easy'), edge('easy', 'ea', 'yes'), edge('easy', 'nav', 'no'), edge('nav', 'check2'), edge('check2', 'fill'),
   edge('ea', 'fill', 'each step'), edge('fill', 'answers'), edge('answers', 'submit'), edge('submit', 'statuses'),
-  edge('open', 'log', undefined, true),
+  edge('open', 'log', undefined, true), edge('answers', 'assist', 'instruct', true),
 ];
 
 function Canvas({ model, height, onPromptClick, fullscreen }: { model: string; height: number | string; onPromptClick?: (key: string) => void; fullscreen?: boolean }) {

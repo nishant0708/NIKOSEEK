@@ -4,17 +4,20 @@ import '@xyflow/react/dist/style.css';
 import {
   LoaderCircle, Network, Radio, RefreshCw, Workflow as WorkflowIcon,
   ChevronDown, ChevronRight, AlertTriangle, Eye, X,
-  Brain, MousePointerClick, Info, CircleAlert, Flag, Crosshair
+  Brain, MousePointerClick, Info, CircleAlert, Flag, Crosshair, CircleHelp
 } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { ApplicationFormPanel } from '../components/workflow/ApplicationFormPanel';
 import { StatusActions } from '../components/workflow/StatusActions';
-import { api, type AgentEvent, type AgentStageKey, type Application, type ManualStatus } from '../lib/api';
+import { LiveBrowserPanel } from '../components/workflow/LiveBrowserPanel';
+import { AgentQuestionCard } from '../components/workflow/AgentQuestionCard';
+import { InstructAgent } from '../components/workflow/InstructAgent';
+import { api, type AgentEvent, type AgentStageKey, type Application, type BrowserFrame, type ManualStatus } from '../lib/api';
 
 const STAGE_NODES = [
-  { id: 'open', label: 'Opening job page', detail: 'Open the posting in your LinkedIn window.' },
-  { id: 'login', label: 'Checking LinkedIn login', detail: 'Reuse the connected session; if it expired, finish login there.' },
-  { id: 'find', label: 'Finding apply button', detail: 'AI picks Apply → company site → application form.' },
+  { id: 'open', label: 'Opening job page', detail: 'Open the posting in your {provider} window.' },
+  { id: 'login', label: 'Checking {provider} login', detail: 'Reuse the connected session; if it expired, finish login there.' },
+  { id: 'find', label: 'Finding apply button', detail: 'Easy Apply / Indeed Apply, or AI picks Apply → company site. Stuck? It asks you.' },
   { id: 'fields', label: 'Filling the form', detail: 'AI fills what your profile answers (Easy Apply: step by step) + resume.' },
   { id: 'review', label: 'Your answers & submit', detail: 'Fill the missing answers below, then press Submit.' },
 ] as const;
@@ -29,6 +32,7 @@ const KIND_STYLE: Record<AgentEvent['kind'], { icon: typeof Brain; color: string
   warning: { icon: AlertTriangle, color: '#A0590F', bg: '#FFF0DE', label: 'Needs you' },
   error: { icon: CircleAlert, color: '#AD3212', bg: '#FFE1D6', label: 'Error' },
   stage: { icon: Flag, color: '#F56A22', bg: '#FFF9F0', label: 'Stage' },
+  question: { icon: CircleHelp, color: '#C2410C', bg: '#FFEAD5', label: 'Asked you' },
 };
 
 function nodeStyle(state: 'pending' | 'active' | 'done' | 'alert') {
@@ -243,6 +247,11 @@ export function LiveWorkflow({ token }: { token: string }) {
   const [eventsByApp, setEventsByApp] = useState<Record<number, AgentEvent[]>>({});
 
   const prevAppsRef = useRef<Map<number, string>>(new Map());
+  const prevQuestionRef = useRef<Map<number, string | null>>(new Map());
+  // Live browser view: which application's tab is streamed, and the latest frame.
+  const socketRef = useRef<WebSocket | null>(null);
+  const watchRef = useRef<number | null>(null);
+  const [browserFrame, setBrowserFrame] = useState<BrowserFrame | null>(null);
   const toastCountRef = useRef(0);
 
   const showToast = (message: string) => {
@@ -264,6 +273,10 @@ export function LiveWorkflow({ token }: { token: string }) {
       if (app.status === 'FAILED') showToast(`⚠️ ${app.job.title ?? 'A job'} failed: ${(app.error ?? '').slice(0, 80)}`);
     }
     prevAppsRef.current.set(app.id, app.status);
+    if (app.pending_question && prevQuestionRef.current.get(app.id) !== app.pending_question.id) {
+      showToast(`🙋 ${app.job.title ?? 'A job'}: the agent needs your answer.`);
+    }
+    prevQuestionRef.current.set(app.id, app.pending_question?.id ?? null);
   };
 
   const appendEvent = (event: AgentEvent) => {
@@ -292,8 +305,10 @@ export function LiveWorkflow({ token }: { token: string }) {
     const connect = () => {
       if (cancelled) return;
       socket = new WebSocket(api.applicationSocketUrl(token));
+      socketRef.current = socket;
       socket.onopen = () => {
         setConnected(true);
+        if (watchRef.current) socket?.send(JSON.stringify({ type: 'browser.watch', application_id: watchRef.current }));
         ping = window.setInterval(() => socket?.readyState === WebSocket.OPEN && socket.send('ping'), 25000);
       };
       socket.onclose = () => {
@@ -304,7 +319,7 @@ export function LiveWorkflow({ token }: { token: string }) {
       socket.onerror = () => setConnected(false);
       socket.onmessage = event => {
         try {
-          const payload = JSON.parse(event.data) as { type?: string; applications?: Application[]; application?: Application; event?: AgentEvent };
+          const payload = JSON.parse(event.data) as { type?: string; applications?: Application[]; application?: Application; event?: AgentEvent; application_id?: number } & Partial<BrowserFrame> & Partial<Pick<Application, 'llm_input_tokens' | 'llm_output_tokens' | 'llm_total_tokens' | 'llm_calls'>>;
           if (payload.type === 'snapshot' && payload.applications) {
             setApplications(payload.applications);
             payload.applications.forEach(app => prevAppsRef.current.set(app.id, app.status));
@@ -312,6 +327,11 @@ export function LiveWorkflow({ token }: { token: string }) {
             upsertApplication(payload.application);
           } else if (payload.type === 'application.event' && payload.event) {
             appendEvent(payload.event);
+          } else if (payload.type === 'application.tokens' && payload.application_id) {
+            const { application_id: id, llm_input_tokens, llm_output_tokens, llm_total_tokens, llm_calls } = payload;
+            setApplications(current => current.map(app => app.id === id ? { ...app, llm_input_tokens, llm_output_tokens, llm_total_tokens, llm_calls } : app));
+          } else if (payload.type === 'browser.frame' && payload.application_id) {
+            setBrowserFrame(payload as BrowserFrame);
           }
         } catch {
           return;
@@ -357,6 +377,19 @@ export function LiveWorkflow({ token }: { token: string }) {
     return () => { cancelled = true; };
   }, [token, selectedApp?.id, selectedApp?.status]);
 
+  const provider = (selectedApp?.job.source ?? '').toLowerCase() === 'indeed' ? 'Indeed' : 'LinkedIn';
+
+  // Stream the selected job's browser tab while it has one (running or waiting for you).
+  const watchId = selectedApp && ['IN_PROGRESS', 'HUMAN_REVIEW_REQUIRED'].includes(selectedApp.status) ? selectedApp.id : null;
+  useEffect(() => {
+    watchRef.current = watchId;
+    const socket = socketRef.current;
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(watchId ? { type: 'browser.watch', application_id: watchId } : { type: 'browser.unwatch' }));
+    }
+    if (!watchId) setBrowserFrame(null);
+  }, [watchId, connected]);
+
   const failedApplications = applications.filter(application => application.status === 'FAILED');
   const queuedApplications = applications.filter(application => application.status === 'PENDING');
   const inProgressApplications = applications.filter(application => application.status === 'IN_PROGRESS');
@@ -396,7 +429,7 @@ export function LiveWorkflow({ token }: { token: string }) {
       return {
         id: node.id,
         position: { x: 40, y: 28 + index * ROW_HEIGHT },
-        data: { label: `${label}\n${node.detail}` },
+        data: { label: `${label.replace('{provider}', provider)}\n${node.detail.replace('{provider}', provider)}` },
         style: state === 'active' ? { ...style, animation: 'pulseGlow 2s infinite' } : style,
       };
     });
@@ -418,7 +451,7 @@ export function LiveWorkflow({ token }: { token: string }) {
       });
     });
     return [...stageNodes, ...logNodes];
-  }, [events, currentIndex, isFailed, isReview, isRunning]);
+  }, [events, currentIndex, isFailed, isReview, isRunning, provider]);
 
   const flowEdges: Edge[] = useMemo(() => {
     const stageEdges: Edge[] = STAGE_NODES.slice(0, -1).map((node, index) => ({
@@ -482,17 +515,19 @@ export function LiveWorkflow({ token }: { token: string }) {
         <section className="mx-auto max-w-7xl">
           <p className="flex items-center gap-2 text-xs font-black uppercase tracking-[.16em] text-orange"><Network size={15} /> Live workflow</p>
           <h1 className="mt-2 text-4xl font-black">Queue, status, and retries</h1>
-          <p className="mt-3 max-w-2xl text-[#805940]">Watch each job live: the agent opens the posting in your LinkedIn window, finds the company’s application form, fills it from your profile and hands it to you for review. Every AI decision is logged below.</p>
+          <p className="mt-3 max-w-2xl text-[#805940]">Watch each job live: the agent opens the posting in your LinkedIn or Indeed window, reaches the application form (Easy Apply, Indeed Apply or the company site), fills it from your profile and hands it to you to review and submit. You can watch and click in the live browser view, answer its questions, and every AI decision is logged.</p>
 
           <div className="mt-7 grid gap-6 lg:grid-cols-[minmax(0,1.2fr)_380px]">
             <div className="flex flex-col gap-6">
+              {selectedApp?.pending_question && <AgentQuestionCard token={token} application={selectedApp} onUpdated={upsertApplication} />}
+
               {selectedApp?.status === 'HUMAN_REVIEW_REQUIRED' && (
                 <div className="bg-[#FFF0EB] border border-[#E9A38E] rounded-xl p-4 flex items-center justify-between shadow-sm">
                   <div className="flex items-center gap-3">
                     <AlertTriangle className="text-[#AD3212]" size={20} />
                     <div>
                       <p className="font-bold text-[#AD3212]">{selectedApp.stage}</p>
-                      <p className="text-sm text-[#AD3212]/80">{selectedApp.job.title} is open in the LinkedIn browser window. Answer the missing fields in “Application form” below and submit from here — or do it directly in the browser.</p>
+                      <p className="text-sm text-[#AD3212]/80">{selectedApp.job.title} is open in the {provider} browser window. Answer the missing fields in “Application form” below and submit from here — or do it directly in the browser.</p>
                     </div>
                   </div>
                   {selectedApp.application_url && (
@@ -548,10 +583,15 @@ export function LiveWorkflow({ token }: { token: string }) {
                 </div>
               </div>
 
+              {watchId && selectedApp && <LiveBrowserPanel token={token} applicationId={selectedApp.id} frame={browserFrame} provider={provider} />}
+
               {selectedApp && <AgentLogPanel events={events} live={isRunning} application={selectedApp} />}
 
               {selectedApp && ['HUMAN_REVIEW_REQUIRED', 'SUBMITTED', 'COMPLETED', 'REJECTED', 'FAILED'].includes(selectedApp.status) && (
                 <ApplicationFormPanel token={token} application={selectedApp} onUpdated={upsertApplication} />
+              )}
+              {selectedApp?.status === 'HUMAN_REVIEW_REQUIRED' && (selectedApp.form_data as { session_open?: boolean } | undefined)?.session_open !== false && (
+                <InstructAgent token={token} application={selectedApp} onUpdated={upsertApplication} />
               )}
             </div>
 

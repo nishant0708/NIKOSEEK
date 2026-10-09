@@ -27,6 +27,7 @@ function MarkdownPreview({ markdown }: { markdown: string }) {
 
 function IndeedLogin({ token }: { token: string }) {
   const [email, setEmail] = useState('');
+  const savedEmail = useRef('');
   const [session, setSession] = useState<IndeedSession | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
@@ -34,13 +35,16 @@ function IndeedLogin({ token }: { token: string }) {
   const applySession = (next: IndeedSession) => { setSession(next); if (next.status !== 'LOGIN_IN_PROGRESS' && poll.current) { window.clearInterval(poll.current); poll.current = null; } };
   const startPolling = () => { if (poll.current) window.clearInterval(poll.current); poll.current = window.setInterval(() => { api.indeedSession(token).then(applySession).catch(() => undefined); }, 2000); };
   useEffect(() => {
-    Promise.all([api.indeedSession(token), api.indeedCredentials(token)]).then(([next, credentials]) => { applySession(next); setEmail(credentials.email); if (next.status === 'LOGIN_IN_PROGRESS') startPolling(); }).catch(() => undefined);
+    Promise.all([api.indeedSession(token), api.indeedCredentials(token)]).then(([next, credentials]) => { applySession(next); setEmail(credentials.email); savedEmail.current = credentials.email; if (next.status === 'LOGIN_IN_PROGRESS') startPolling(); }).catch(() => undefined);
     return () => { if (poll.current) window.clearInterval(poll.current); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
-  async function connect() { setBusy(true); setMessage(''); try { applySession(await api.connectIndeed(token)); startPolling(); } catch (e) { setMessage(e instanceof Error ? e.message : 'Could not open the Indeed window.'); } finally { setBusy(false); } }
+  async function connect() { setBusy(true); setMessage(''); try {
+    // Save the typed email first, so the connect flow (and users.agent_config) always has it.
+    if (email.trim() && email.trim() !== savedEmail.current) { const saved = await api.saveIndeedCredentials(token, { email: email.trim() }); savedEmail.current = saved.email; setEmail(saved.email); }
+    applySession(await api.connectIndeed(token)); startPolling(); } catch (e) { setMessage(e instanceof Error ? e.message : 'Could not open the Indeed window.'); } finally { setBusy(false); } }
   async function disconnect() { setBusy(true); setMessage(''); try { applySession(await api.disconnectIndeed(token)); setMessage('Indeed disconnected.'); } catch (e) { setMessage(e instanceof Error ? e.message : 'Could not disconnect Indeed.'); } finally { setBusy(false); } }
-  async function save() { setBusy(true); setMessage(''); try { const result = await api.saveIndeedCredentials(token, { email }); setEmail(result.email); setMessage('Indeed email saved.'); } catch (e) { setMessage(e instanceof Error ? e.message : 'Could not save Indeed email.'); } finally { setBusy(false); } }
+  async function save() { setBusy(true); setMessage(''); try { const result = await api.saveIndeedCredentials(token, { email }); setEmail(result.email); savedEmail.current = result.email; setMessage('Indeed email saved.'); } catch (e) { setMessage(e instanceof Error ? e.message : 'Could not save Indeed email.'); } finally { setBusy(false); } }
   const status = session?.status;
   return <div className="mt-5 rounded-[1.75rem] border border-[#E8C9A4] bg-[#FFFDF8] p-5"><div className="flex items-center gap-2"><KeyRound className="text-orange" size={18} /><h2 className="text-xl font-black">Indeed login</h2></div>
     <div className={`mt-4 flex flex-wrap items-center gap-3 rounded-2xl px-4 py-3 text-sm font-bold ${status === 'READY' ? 'bg-[#E3F7D9] text-[#347233]' : status === 'LOGIN_IN_PROGRESS' ? 'bg-[#FFF0DE] text-[#92502A]' : 'bg-[#FFE1D6] text-[#AD3212]'}`}>
@@ -58,6 +62,7 @@ export function ProfileReview({ token, onDone, onLinkedinChange }: { token: stri
   const [markdown, setMarkdown] = useState('');
   const [linkedinEmail, setLinkedinEmail] = useState('');
   const [linkedinPassword, setLinkedinPassword] = useState('');
+  const savedLinkedinEmail = useRef('');
   const [passwordSet, setPasswordSet] = useState(false);
   const [editingPassword, setEditingPassword] = useState(false);
   const [busy, setBusy] = useState(true);
@@ -87,7 +92,15 @@ export function ProfileReview({ token, onDone, onLinkedinChange }: { token: stri
 
   async function connectLinkedin() {
     setSessionBusy(true); setError('');
-    try { applySession(await api.connectLinkedin(token)); startPolling(); }
+    try {
+      // Save typed-but-unsaved credentials first so they are stored before the login window opens.
+      const typedPassword = editingPassword && linkedinPassword ? linkedinPassword : undefined;
+      if (linkedinEmail.trim() && (linkedinEmail.trim() !== savedLinkedinEmail.current || typedPassword) && (passwordSet || typedPassword)) {
+        const saved = await api.saveLinkedinCredentials(token, { email: linkedinEmail.trim(), password: typedPassword });
+        savedLinkedinEmail.current = saved.email; setLinkedinEmail(saved.email); setPasswordSet(saved.password_set); setLinkedinPassword(''); setEditingPassword(!saved.password_set);
+      }
+      applySession(await api.connectLinkedin(token)); startPolling();
+    }
     catch (e) { setError(e instanceof Error ? e.message : 'Could not open the LinkedIn window.'); }
     finally { setSessionBusy(false); }
   }
@@ -104,6 +117,7 @@ export function ProfileReview({ token, onDone, onLinkedinChange }: { token: stri
       .then(([profile, linkedin]) => {
         setMarkdown(profile.markdown ?? '');
         setLinkedinEmail(linkedin.email);
+        savedLinkedinEmail.current = linkedin.email;
         setPasswordSet(linkedin.password_set);
         setEditingPassword(!linkedin.password_set);
       })
@@ -134,6 +148,7 @@ export function ProfileReview({ token, onDone, onLinkedinChange }: { token: stri
         password: editingPassword && linkedinPassword ? linkedinPassword : undefined,
       });
       setLinkedinEmail(result.email);
+      savedLinkedinEmail.current = result.email;
       setPasswordSet(result.password_set);
       setLinkedinPassword('');
       setEditingPassword(!result.password_set);

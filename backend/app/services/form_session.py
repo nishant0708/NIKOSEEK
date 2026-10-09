@@ -16,12 +16,13 @@ import re
 from dataclasses import dataclass, field as dc_field
 
 from app.db.models import User
-from app.services.form_filler import collect_fields, fill_fields, resolve_root, resolve_values, upload_resume
+from app.services.form_filler import collect_fields, fill_fields, find_root_in_page, resolve_root, resolve_values, upload_resume
 from app.services.job_navigator import find_form_frame
 
 logger = logging.getLogger(__name__)
 
-EASY_APPLY_ROOT = '.jobs-easy-apply-modal, [data-test-modal-id="easy-apply-modal"], div[role="dialog"]'
+# LinkedIn (2026) uses a native <dialog open data-testid="dialog"> with obfuscated classes; older UIs used role=dialog.
+EASY_APPLY_ROOT = 'dialog[open], [data-testid="dialog"], .jobs-easy-apply-modal, [data-test-modal-id="easy-apply-modal"], div[role="dialog"]'
 NEXT_PATTERN = re.compile(r"^\s*(next|continue)\b", re.I)
 REVIEW_PATTERN = re.compile(r"^\s*review\b", re.I)
 SUBMIT_TEXT_PATTERN = re.compile(r"submit( application)?|send application|^\s*apply( now)?\s*$", re.I)
@@ -30,7 +31,8 @@ SUCCESS_PATTERN = re.compile(
     r"we('ve| have) received your application|successfully (applied|submitted)|your application has been",
     re.I,
 )
-MAX_AUTO_STEPS = 8
+MAX_AUTO_STEPS = 10
+INDEED_NEXT_PATTERN = re.compile(r"^\s*(continue|next|review your application)\b", re.I)
 
 
 @dataclass
@@ -38,7 +40,7 @@ class FormSession:
     application_id: int
     user_id: int
     page: object
-    mode: str  # "external" | "easy_apply"
+    mode: str  # "external" | "easy_apply" | "indeed_apply"
     resume_key: str | None
     frame: object | None = None
     fields: list[dict] = dc_field(default_factory=list)
@@ -48,7 +50,9 @@ class FormSession:
     resume_uploaded: str | None = None
     mapping: str = "none"
     last_errors: dict[str, str] = dc_field(default_factory=dict)
-    answers: dict[str, dict] = dc_field(default_factory=dict)  # "step:label" -> what ended up in the form
+    answers: dict[str, dict] = dc_field(default_factory=dict)  # label -> what ended up in the form (latest step wins)
+    notes: list[str] = dc_field(default_factory=list)  # facts you told the agent during this application
+    blocked_keys: set[str] = dc_field(default_factory=set)  # fields the site would not accept (Next didn't advance)
     lock: asyncio.Lock = dc_field(default_factory=asyncio.Lock)
 
     # ---- page helpers --------------------------------------------------------
@@ -63,9 +67,21 @@ class FormSession:
         except Exception:
             return False
 
+    @property
+    def stepped(self) -> bool:
+        """Multi-step flows where the agent presses Continue/Next itself (never the final Submit)."""
+        return self.mode in ("easy_apply", "indeed_apply")
+
     async def _target_frame(self):
-        if self.mode == "easy_apply":
+        if self.mode == "indeed_apply":
             return self.page.main_frame
+        if self.mode == "easy_apply":
+            # The dialog may live in the main frame or an iframe; re-locate it if that frame went away.
+            if self.frame is not None and not self.frame.is_detached() and await resolve_root(self.frame, self.root) is not None:
+                return self.frame
+            frame, _ = await find_root_in_page(self.page, self.root)
+            self.frame = frame or self.page.main_frame
+            return self.frame
         if self.frame is not None and not self.frame.is_detached():
             return self.frame
         frame, _ = await find_form_frame(self.page)
@@ -99,14 +115,25 @@ class FormSession:
         return None
 
     async def _next_button(self, frame):
+        if self.mode == "indeed_apply":
+            if await self._submit_button(frame) is not None:
+                return None
+            return await self._button(frame, aria=None, text=INDEED_NEXT_PATTERN)
         if self.mode != "easy_apply":
             return None
         return (await self._button(frame, aria="Continue to next step", text=NEXT_PATTERN)
                 or await self._button(frame, aria="Review your application", text=REVIEW_PATTERN))
 
+    async def _back_button(self, frame):
+        if not self.stepped:
+            return None
+        return await self._button(frame, aria="Back to previous step", text=re.compile(r"^\s*(back|previous)\b", re.I))
+
     async def _submit_button(self, frame):
         if self.mode == "easy_apply":
             return await self._button(frame, aria="Submit application", text=re.compile(r"submit application", re.I))
+        if self.mode == "indeed_apply":
+            return await self._button(frame, aria=None, text=re.compile(r"submit (your )?application", re.I))
         scope = frame.locator("body")
         typed = scope.locator('button[type="submit"]:visible, input[type="submit"]:visible')
         if await typed.count() > 0:
@@ -130,13 +157,21 @@ class FormSession:
                 "key": f["key"], "kind": f["kind"], "label": f.get("label") or f.get("name") or f.get("placeholder") or f["key"],
                 "name": f.get("name"), "required": bool(f.get("required")), "options": f.get("options"),
                 "value": f.get("value") or "", "error": self.last_errors.get(f["key"]) or f.get("error") or "",
-                "source": source, "group": f.get("group"),
+                "source": source, "group": f.get("group"), "hint": f.get("hint") or "",
             })
         for f in fields:  # remember every answer across steps (saved in form_data.answers)
+            label = f["label"]
             if f["value"]:
-                self.answers[f"{self.step}:{f['label']}"] = {"step": self.step, "label": f["label"], "value": f["value"], "source": f["source"], "kind": f["kind"]}
+                self.answers[label] = {"step": self.step, "label": label, "value": f["value"], "source": f["source"], "kind": f["kind"]}
+            elif self.answers.get(label, {}).get("step") == self.step:
+                # A recheck can clear a browser-prefilled or hallucinated value.
+                # Do not keep showing that stale value in the saved answers table.
+                self.answers.pop(label, None)
         missing = [f["key"] for f in fields if not f["value"]]
-        missing_required = [f["key"] for f in fields if f["required"] and not f["value"]]
+        missing_required = [
+            f["key"] for f in fields
+            if ((f["required"] or f["key"] in self.blocked_keys) and not f["value"]) or (f["error"] and f["key"] in self.blocked_keys)
+        ]
         return {
             "mode": self.mode,
             "session_open": self.is_open,
@@ -157,9 +192,11 @@ class FormSession:
     async def _autofill_current(self, user: User, job, log) -> dict:
         frame = await self._target_frame()
         self.fields = await collect_fields(frame, self.root)
-        await log("info", f"{'Easy Apply step ' + str(self.step) if self.mode == 'easy_apply' else 'Form'}: found {len(self.fields)} fields.",
+        await log("info", f"{self.flow_name} step {self.step}: found {len(self.fields)} fields." if self.stepped else f"Form: found {len(self.fields)} fields.",
                   data={"labels": [f.get("label") for f in self.fields][:40], "step": self.step})
-        values, self.mapping = await resolve_values(self.fields, user, job)
+        # LinkedIn restores values from the user's browser profile. Treat those values as
+        # candidates too: they still need to be checked against the saved application profile.
+        values, self.mapping = await resolve_values(self.fields, user, job, self.notes, recheck_all=True)
         filled, errors = await fill_fields(frame, self.fields, values)
         self.ai_keys |= set(filled)
         self.last_errors = errors
@@ -173,7 +210,11 @@ class FormSession:
         snap = await self.refresh()
         asked = [f["label"] for f in snap["fields"] if not f["value"]]
         await log("thinking", f"AI filled {len(filled)} field(s) ({self.mapping}); {len(asked)} still empty ({len(snap['missing_required'])} required).",
-                  data={"filled": [f["label"] for f in snap["fields"] if f["key"] in filled], "needs_input": asked[:40]})
+                  data={
+                      "filled": [f["label"] for f in snap["fields"] if f["key"] in filled],
+                      "needs_input": asked[:40],
+                      "fill_errors": {f.get("label"): error for key, error in errors.items() for f in self.fields if f["key"] == key},
+                  })
         return snap
 
     async def autofill(self, user: User, job, log, snap: dict | None = None) -> dict:
@@ -181,34 +222,72 @@ class FormSession:
         if snap is None:
             snap = await self._autofill_current(user, job, log)
         for _ in range(MAX_AUTO_STEPS):
-            if self.mode != "easy_apply" or snap["missing_required"] or not snap["has_next"]:
+            if not self.stepped or snap["missing_required"] or not snap["has_next"]:
                 break
             advanced, snap = await self._advance(user, job, log)
             if not advanced:
                 break
         return snap
 
-    async def _advance(self, user: User, job, log) -> tuple[bool, dict]:
+    async def _signature(self, frame) -> tuple:
+        """What identifies the current step: field labels, the step/progress text and the forward button."""
+        labels = tuple(f.get("label") for f in await collect_fields(frame, self.root))
+        progress = ""
+        try:
+            scope = await self._scope(frame)
+            text = await scope.inner_text(timeout=3000)
+            match = re.search(r"\d+\s*/\s*\d+\s*pages?|\d+\s*%|step\s*\d+\s*of\s*\d+", text, re.I)
+            progress = match.group(0) if match else ""
+        except Exception:
+            pass
+        button = await self._next_button(frame) or await self._submit_button(frame)
+        try:
+            button_text = (await button.inner_text()).strip() if button is not None else ""
+        except Exception:
+            button_text = ""
+        return labels, progress, button_text
+
+    async def _advance(self, user: User, job, log, *, retried: bool = False) -> tuple[bool, dict]:
         frame = await self._target_frame()
         button = await self._next_button(frame)
         if button is None:
             return False, await self.snapshot()
         label = (await button.inner_text()).strip() or "Next"
-        before = [f.get("label") for f in self.fields]
+        before = await self._signature(frame)
         await button.click(timeout=5000)
+        try:
+            await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass
         await self.page.wait_for_timeout(1500)
-        probe = await collect_fields(frame, self.root)
-        errors = [f for f in probe if f.get("error")]
-        if errors and [f.get("label") for f in probe] == before:
-            self.fields = probe
-            await log("warning", f"LinkedIn did not accept this step: {errors[0].get('label')}: {errors[0].get('error')}",
-                      data={"errors": {f.get('label'): f.get('error') for f in errors}})
+        frame = await self._target_frame()
+        after = await self._signature(frame)
+        if after == before:
+            # The site did not move on: an answer was rejected (e.g. "10 LPA" in a numbers-only box) or something is missing.
+            self.fields = await collect_fields(frame, self.root)
+            errors = [f for f in self.fields if f.get("error")]
+            stuck = [f for f in self.fields if f.get("error") or not f.get("value")]
+            if not retried and stuck:
+                await log("thinking", f"“{label}” did not advance — asking the AI to correct the rejected/empty answers and trying once more.",
+                          data={"errors": {f.get('label'): f.get('error') for f in errors}, "empty": [f.get("label") for f in stuck if not f.get("value")]})
+                values, _ = await resolve_values(stuck, user, job, self.notes)
+                filled, fill_errors = await fill_fields(frame, self.fields, values)
+                self.ai_keys |= set(filled)
+                if filled:
+                    self.fields = await collect_fields(frame, self.root)
+                    await self.snapshot()  # record the corrected answers (e.g. "10 LPA" -> "10")
+                    return await self._advance(user, job, log, retried=True)
+            self.blocked_keys = {f["key"] for f in stuck}
+            reason = f"{errors[0].get('label')}: {errors[0].get('error')}" if errors else "an answer on this step is still missing or not accepted"
+            await log("warning", f"{self.flow_name} did not accept this step — {reason}. Fix it below (or tell the agent) and it will continue.",
+                      data={"errors": {f.get('label'): f.get('error') for f in errors}, "stuck": [f.get("label") for f in stuck]})
             return False, await self.snapshot()
         self.step += 1
         self.ai_keys.clear()  # keys (f0, f1, ...) are re-assigned on every step
         self.user_keys.clear()
+        self.blocked_keys.clear()
         self.last_errors = {}
-        await log("action", f"Clicked “{label}” → Easy Apply step {self.step}.")
+        await log("action", f"Clicked “{label}” → {self.flow_name} step {self.step}.")
         return True, await self._autofill_current(user, job, log)
 
     async def next_step(self, user: User, job, log) -> dict:
@@ -217,12 +296,56 @@ class FormSession:
             return await self.autofill(user, job, log, snap)
         return snap
 
+    @property
+    def flow_name(self) -> str:
+        return {"easy_apply": "Easy Apply", "indeed_apply": "Indeed Apply"}.get(self.mode, "Form")
+
+    async def instruct(self, instruction: str, user: User, job, log) -> dict:
+        """Your free-text instruction -> AI clicks / fills on this tab, then a fresh snapshot."""
+        from app.services.agent_assist import run_instruction
+
+        frame = await self._target_frame()
+        if not self.fields:
+            self.fields = await collect_fields(frame, self.root)
+        scope = await resolve_root(frame, self.root) if self.root else None
+        self.notes.append(instruction)
+        result = await run_instruction(self, frame, scope, instruction, user, job, log)
+        frame = await self._target_frame()
+        self.user_keys |= set(result.get("filled_keys") or [])
+        if any(d.startswith("went ") for d in result.get("done") or []):
+            # We moved between steps: re-fill anything the site dropped, using your notes + profile.
+            snap = await self._autofill_current(user, job, log)
+            self.user_keys |= set(result.get("filled_keys") or [])
+            return snap
+        try:
+            await self.page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
+        await self.page.wait_for_timeout(800)
+        return await self.refresh()
+
+    async def recheck(self, user: User, job, log) -> dict:
+        """Re-validate EVERY field on this step against your profile / answers / notes and fix what doesn't match."""
+        frame = await self._target_frame()
+        self.fields = await collect_fields(frame, self.root)
+        values, self.mapping = await resolve_values(self.fields, user, job, self.notes, recheck_all=True)
+        labels = {f["key"]: f.get("label") for f in self.fields}
+        filled, errors = await fill_fields(frame, self.fields, values)
+        self.ai_keys |= set(filled)
+        self.last_errors = errors
+        await log("thinking", f"Checked {len(self.fields)} field(s) against your profile: changed {len(filled)}"
+                  + (f" ({', '.join(str(labels.get(k)) for k in filled)})" if filled else "") + ".",
+                  data={"changed": {labels.get(k): values[k] for k in filled}})
+        return await self.refresh()
+
     async def apply_values(self, values: dict[str, str], log) -> dict:
         frame = await self._target_frame()
         if not self.fields:
             self.fields = await collect_fields(frame, self.root)
         filled, errors = await fill_fields(frame, self.fields, values)
         self.user_keys |= set(filled)
+        labels_by_key = {f["key"]: f.get("label") for f in self.fields}
+        self.notes.extend(f"{labels_by_key.get(k) or k}: {values[k]}" for k in filled)
         self.last_errors = errors
         labels = {f["key"]: f.get("label") for f in self.fields}
         await log("action", f"Filled {len(filled)} field(s) with your answers" + (f"; {len(errors)} failed." if errors else "."),
@@ -246,14 +369,14 @@ class FormSession:
             # inner_text through Playwright also reads LinkedIn's shadow-DOM dialog content.
             text = await self.page.locator("body").inner_text(timeout=5000)
             if self.mode == "easy_apply":
-                scope = await resolve_root(self.page.main_frame, self.root)
+                _, scope = await find_root_in_page(self.page, self.root)
                 if scope is not None:
                     text += "\n" + await scope.inner_text(timeout=3000)
         except Exception:
             pass
         success = bool(SUCCESS_PATTERN.search(text))
         if not success and self.mode == "easy_apply":
-            success = await self.page.locator(f"{EASY_APPLY_ROOT} >> visible=true").count() == 0
+            success = (await find_root_in_page(self.page, self.root))[1] is None
         if success:
             return True, snap, "Application submitted."
         snap = await self.refresh()

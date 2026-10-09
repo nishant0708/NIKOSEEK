@@ -1,4 +1,4 @@
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.config import settings
@@ -13,6 +13,25 @@ Search preferences: role={search_term}; experience={experience}; minimum salary=
 Accept only credible matches that align with role, seniority, skills and location. Missing salary alone must not reject a job. Mark accepted only where score is 65 or higher. Reasons must be concise and actionable."""
 
 
+def fresh_config(user: User) -> dict:
+    """Re-read users.agent_config with a row lock before changing it.
+
+    Several things write this one JSON column (LinkedIn creds, Indeed creds, prompts, model, session status).
+    Each request used to copy the dict it loaded earlier and write the whole thing back, so two overlapping
+    writes (e.g. connecting Indeed while the LinkedIn window was being connected/saved) silently dropped the
+    other provider's keys. Locking + re-reading makes every write a merge on top of the latest value.
+    """
+    db = object_session(user)
+    if db is not None and user.id is not None:
+        db.refresh(user, attribute_names=["agent_config"], with_for_update=True)
+    return dict(user.agent_config or {})
+
+
+def save_config(user: User, config: dict) -> None:
+    user.agent_config = config
+    flag_modified(user, "agent_config")
+
+
 def get_match_scoring_model(user: User) -> str:
     config = user.agent_config or {}
     model = config.get("match_scoring", {}).get("model")
@@ -22,9 +41,9 @@ def get_match_scoring_model(user: User) -> str:
 
 
 def set_match_scoring_model(user: User, model: str) -> None:
-    config = dict(user.agent_config or {})
+    config = fresh_config(user)
     config["match_scoring"] = {"model": model.strip()}
-    user.agent_config = config
+    save_config(user, config)
 
 
 def get_system_prompt(db: Session) -> SystemPrompt | None:
@@ -61,8 +80,8 @@ def linkedin_public_payload(user: User) -> dict[str, str | bool]:
 
 
 def set_linkedin_credentials(user: User, email: str, password: str | None) -> None:
-    config = dict(user.agent_config or {})
-    linkedin = _linkedin_config(user)
+    config = fresh_config(user)
+    linkedin = dict(config.get("linkedin")) if isinstance(config.get("linkedin"), dict) else {}
     linkedin["email"] = email.strip()
     if password:
         linkedin["password_hash"] = hash_password(password)
@@ -101,8 +120,8 @@ def indeed_public_payload(user: User) -> dict[str, str | bool]:
 
 
 def set_indeed_credentials(user: User, email: str, password: str | None) -> None:
-    config = dict(user.agent_config or {})
-    indeed = _indeed_config(user)
+    config = fresh_config(user)
+    indeed = dict(config.get("indeed")) if isinstance(config.get("indeed"), dict) else {}
     indeed["email"] = email.strip()
     if password:
         indeed["password_hash"] = hash_password(password)

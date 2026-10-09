@@ -26,6 +26,8 @@ from sqlalchemy.orm import Session
 from app.db.models import BrowserSession, User
 from app.services.agent_config import get_linkedin_login
 
+from app.services.browser_common import WINDOW_ARGS, prepare_context
+
 logger = logging.getLogger(__name__)
 
 SOURCE = "linkedin"
@@ -73,7 +75,28 @@ def mark_browser_session(db: Session, session: BrowserSession, *, status: str | 
         session.last_login_at = datetime.now(UTC)
     session.error = error
     session.last_checked_at = datetime.now(UTC)
+    _mirror_session_into_user_config(db, session)
     db.commit()
+
+
+def _mirror_session_into_user_config(db: Session, session: BrowserSession) -> None:
+    """Keep users.agent_config[<source>]["session"] in sync with browser_sessions (merge, never overwrite other keys)."""
+    from app.services.agent_config import fresh_config, save_config
+
+    user = db.get(User, session.user_id)
+    if user is None:
+        return
+    config = fresh_config(user)
+    provider = dict(config.get(session.source)) if isinstance(config.get(session.source), dict) else {}
+    provider["session"] = {
+        "status": session.status,
+        "connected": session.status == READY,
+        "last_login_at": session.last_login_at.isoformat() if session.last_login_at else None,
+        "last_checked_at": session.last_checked_at.isoformat() if session.last_checked_at else None,
+        "error": session.error,
+    }
+    config[session.source] = provider
+    save_config(user, config)
 
 
 def session_payload(session: BrowserSession) -> dict:
@@ -191,8 +214,8 @@ class LinkedInBrowserManager:
         options = {
             "user_data_dir": str(profile_dir),
             "headless": False,
-            "viewport": {"width": 1366, "height": 900},
-            "args": LAUNCH_ARGS,
+            "no_viewport": True,
+            "args": LAUNCH_ARGS + WINDOW_ARGS,
             "ignore_default_args": ["--enable-automation"],
         }
         try:
@@ -209,6 +232,7 @@ class LinkedInBrowserManager:
             except Exception:
                 logger.warning("Could not seed stored LinkedIn cookies into the new profile")
 
+        await prepare_context(context)
         context.on("close", lambda _ctx=None, uid=user_id: self._contexts.pop(uid, None))
         self._contexts[user_id] = context
         return context
