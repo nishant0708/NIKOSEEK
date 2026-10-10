@@ -55,3 +55,60 @@ async def is_challenge_page(page) -> bool:
         return any(t in text for t in CHALLENGE_TEXT)
     except Exception:
         return False
+
+
+async def _frame_shown(frame) -> bool:
+    """Is this iframe actually on screen (not the invisible reCAPTCHA badge / an off-screen challenge holder)?"""
+    try:
+        element = await frame.frame_element()
+        if not await element.is_visible():
+            return False
+        box = await element.bounding_box()
+        return bool(box) and box["width"] > 60 and box["height"] > 60 and box["y"] > -500 and box["x"] > -500
+    except Exception:
+        return False
+
+
+async def captcha_pending(page) -> str | None:
+    """A CAPTCHA that is waiting for a human (reCAPTCHA / hCaptcha / Turnstile), or None.
+    Solved or invisible (score-only) CAPTCHAs return None, so the agent can carry on by itself."""
+    try:
+        if page.is_closed():
+            return None
+        frames = page.frames
+    except Exception:
+        return None
+    for frame in frames:
+        url = (frame.url or "").lower()
+        try:
+            if ("recaptcha/api2/anchor" in url or "recaptcha/enterprise/anchor" in url) and "size=invisible" not in url:
+                if await _frame_shown(frame) and await frame.locator("#recaptcha-anchor").get_attribute("aria-checked", timeout=1500) != "true":
+                    return "reCAPTCHA"
+            elif "recaptcha/api2/bframe" in url or "recaptcha/enterprise/bframe" in url:
+                if await _frame_shown(frame):
+                    box = await (await frame.frame_element()).bounding_box()
+                    if box and box["height"] > 150:
+                        return "reCAPTCHA picture challenge"
+            elif "hcaptcha.com" in url and "frame=checkbox" in url and "size=invisible" not in url:
+                if await _frame_shown(frame) and await frame.locator("#checkbox").get_attribute("aria-checked", timeout=1500) != "true":
+                    return "hCaptcha"
+            elif "hcaptcha.com" in url and "frame=challenge" in url:
+                if await _frame_shown(frame):
+                    box = await (await frame.frame_element()).bounding_box()
+                    if box and box["height"] > 150:
+                        return "hCaptcha picture challenge"
+            elif "challenges.cloudflare.com" in url and frame is not page.main_frame:
+                if await _frame_shown(frame):
+                    token = page.locator('input[name="cf-turnstile-response"]')
+                    if await token.count() == 0 or not (await token.first.input_value(timeout=1500)):
+                        return "Cloudflare Turnstile"
+        except Exception:
+            continue
+    return None
+
+
+async def human_check_pending(page) -> str | None:
+    """Cloudflare interstitial or a visible unsolved CAPTCHA (what kind), else None."""
+    if await is_challenge_page(page):
+        return "human verification page"
+    return await captcha_pending(page)

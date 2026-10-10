@@ -19,11 +19,12 @@ import re
 from collections.abc import Awaitable, Callable
 
 from app.db.models import ScrapedJob, User
-from app.services.browser_common import is_challenge_page
+from app.services.browser_common import human_check_pending
 from app.services.form_filler import FIELD_LOCATOR, diagnose_page, find_root_in_page
 from app.services.linkedin_browser import has_session_cookie, is_auth_url, page_looks_logged_out
 from app.services.llm import generate_json_object
 from app.services.prompts import render
+from app.services.workday_portal_navigator import detect_ats, ensure_signed_in, ats_prepare, is_stepped_portal
 
 logger = logging.getLogger(__name__)
 
@@ -117,13 +118,19 @@ async def _form_on(page):
     return (frame, count) if frame is not None and count >= MIN_FORM_FIELDS else None
 
 
-def _clickable_candidates(elements: list[dict]) -> list[dict]:
-    """Hard safety rails, independent of the LLM."""
+def _on_job_board(page) -> bool:
+    url = page.url or ""
+    return "linkedin.com" in url or "indeed.com" in url
+
+
+def _clickable_candidates(elements: list[dict], on_board: bool = True) -> list[dict]:
+    """Hard safety rails, independent of the LLM. Sign-in / sign-up controls are blocked on LinkedIn / Indeed only:
+    on a company portal (Workday, iCIMS ...) signing in is part of applying (handled by ats.py)."""
     return [
         e for e in elements
         if not EASY_APPLY_PATTERN.search(e["text"])
         and not SUBMIT_PATTERN.search(e["text"])
-        and not AUTH_CONTROL_PATTERN.search(e["text"])
+        and not (on_board and AUTH_CONTROL_PATTERN.search(e["text"]))
         and not is_auth_url(e.get("href") or "")
     ]
 
@@ -295,6 +302,17 @@ async def _click_and_follow(context, page, idx: int):
 
 
 async def navigate_to_form(context, page, job: ScrapedJob, user: User | None, log: Log, relogin: Relogin, exclude: set | None = None):
+    """navigate() + company-portal mode: multi-page portals (Workday, iCIMS, Taleo, ...) are filled step by step ("ats")."""
+    page, frame, mode = await _navigate(context, page, job, user, log, relogin, exclude)
+    if mode == "external" and is_stepped_portal(page.url):
+        vendor, tenant = detect_ats(page.url)
+        await log("info", f"{tenant} uses {vendor.title()}: filling it page by page (Save and Continue) until the review page.",
+                  data={"portal": f"{vendor}:{tenant}"})
+        mode = "ats"
+    return page, frame, mode
+
+
+async def _navigate(context, page, job: ScrapedJob, user: User | None, log: Log, relogin: Relogin, exclude: set | None = None):
     """Click through from the posting to the application form. Returns (page, form_frame, mode).
     mode: "easy_apply" (LinkedIn dialog) | "indeed_apply" (smartapply.indeed.com) | "external" (company form)."""
     exclude = exclude or set()
@@ -305,17 +323,18 @@ async def navigate_to_form(context, page, job: ScrapedJob, user: User | None, lo
 
     for step in range(1, MAX_NAV_STEPS + 1):
         _track(log, page)
-        # 0) Cloudflare / "verify you are human": never click or reload through it — the human solves it.
-        if await is_challenge_page(page):
-            await log("warning", "A human-verification (Cloudflare) page is showing. Agent paused — don't refresh; complete it in the browser window.",
+        # 0) Cloudflare / CAPTCHA: never click or reload through it — you solve it, the agent notices and goes on.
+        check = await human_check_pending(page)
+        if check:
+            await log("warning", f"{check} is showing. Agent paused — don't refresh; complete it in the browser window.",
                       data={"url": page.url})
 
             async def challenge_gone() -> bool:
-                return not await is_challenge_page(page)
+                return not await human_check_pending(page)
 
-            result = await _ask_user(context, page, user, job, log, "human verification (Cloudflare) page", exclude,
-                                     question="The site wants you to verify you're human. Please complete the check in the browser window "
-                                              "(or the live view). I'll continue automatically once it's gone.",
+            result = await _ask_user(context, page, user, job, log, check, exclude,
+                                     question=f"The site shows a {check}. Please complete it in the browser window "
+                                              "(or the live view). I'll continue automatically once it's solved.",
                                      resolved=challenge_gone)
             if result is None:
                 raise RuntimeError("Human verification was not completed in time.")
@@ -334,6 +353,20 @@ async def navigate_to_form(context, page, job: ScrapedJob, user: User | None, lo
             await log("info", f"Landed on {page.url} instead of the job posting — reopening the job.", data={"url": page.url, "job_url": start_url})
             await page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(2000)
+
+        # 2b) Company portal (Workday, iCIMS, ...): start screens, then sign up / sign in with your job-portal login.
+        if not _on_job_board(page) and user is not None:
+            try:
+                if await ats_prepare(page, user, log):
+                    continue
+                if await ensure_signed_in(page, user, log):
+                    await page.wait_for_timeout(1500)
+                    continue
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                logger.warning("Portal start/sign-in step failed: %s", exc)
+                await log("warning", f"Portal sign-in step failed: {str(exc).splitlines()[0][:150]}", data={"url": page.url})
 
         # 3) Indeed's own apply flow (smartapply.indeed.com): a multi-step form like Easy Apply.
         if _on_indeed_apply(page):
@@ -388,7 +421,7 @@ async def navigate_to_form(context, page, job: ScrapedJob, user: User | None, lo
 
         # 6) Ask the LLM what to click (or use the option you picked).
         snap = await page.evaluate(SNAPSHOT_JS)
-        elements = _clickable_candidates(snap["elements"])
+        elements = _clickable_candidates(snap["elements"], _on_job_board(page))
         if pending_click is not None:
             decision, pending_click = pending_click, None
             chosen = next((e for e in elements if e["text"] == decision.get("text")), None) or next((e for e in elements if e["idx"] == decision.get("idx")), None)

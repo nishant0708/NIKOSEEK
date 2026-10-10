@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass, field as dc_field
 
 from app.db.models import User
-from app.services.form_filler import collect_fields, fill_fields, find_root_in_page, resolve_root, resolve_values, upload_resume
+from app.services.form_filler import _click, collect_fields, fill_fields, find_root_in_page, resolve_root, resolve_values, upload_resume
 from app.services.job_navigator import find_form_frame
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,37 @@ SUCCESS_PATTERN = re.compile(
     r"we('ve| have) received your application|successfully (applied|submitted)|your application has been",
     re.I,
 )
-MAX_AUTO_STEPS = 10
+MAX_AUTO_STEPS = 12
+# Company portals (Workday "Save and Continue", iCIMS / Taleo "Next"). Workday's footer button turns into "Submit" on Review.
+ATS_NEXT_PATTERN = re.compile(r"^\s*(save (and|&) continue|next|continue|save and next)\b", re.I)
+ATS_NEXT_CSS = '[data-automation-id="pageFooterNextButton"], [data-automation-id="bottom-navigation-next-button"]'
+ATS_BACK_CSS = '[data-automation-id="pageFooterBackButton"], [data-automation-id="bottom-navigation-back-button"]'
+ATS_SUBMIT_PATTERN = re.compile(r"^\s*submit( (my |your )?application)?\s*$", re.I)
+# Repeated sections that need an "Add" click per job / degree (Workday "My Experience").
+SECTIONS_JS = r"""() => {
+  const vis = el => !!el && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+  const txt = el => ((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '')).replace(/\s+/g, ' ').trim();
+  const isAdd = b => /^add( another)?\b/i.test(txt(b));
+  document.querySelectorAll('[data-section-add]').forEach(e => e.removeAttribute('data-section-add'));
+  const kinds = [
+    ['experience', /^(work experience|employment( history)?|professional experience|experience)\b/i, /^(work experience|employment|experience)\s*\d+/i],
+    ['education', /^education\b/i, /^education\s*\d+/i],
+  ];
+  const heads = [...document.querySelectorAll('h2, h3, h4, legend, [role="heading"]')].filter(vis);
+  const out = [];
+  for (const [kind, headRe, entryRe] of kinds) {
+    const head = heads.find(h => headRe.test(txt(h)) && !entryRe.test(txt(h)));
+    if (!head) continue;
+    let box = head.parentElement;
+    for (let i = 0; i < 6 && box && ![...box.querySelectorAll('button, [role="button"]')].some(b => vis(b) && isAdd(b)); i++) box = box.parentElement;
+    if (!box) continue;
+    const add = [...box.querySelectorAll('button, [role="button"]')].filter(vis).find(isAdd);
+    const entries = [...box.querySelectorAll('h3, h4, h5, legend, [role="heading"]')].filter(h => entryRe.test(txt(h))).length;
+    if (add) add.setAttribute('data-section-add', kind);
+    out.push({ kind, entries, add: !!add });
+  }
+  return out;
+}"""
 INDEED_NEXT_PATTERN = re.compile(r"^\s*(continue|next|review your application)\b", re.I)
 
 
@@ -40,7 +70,7 @@ class FormSession:
     application_id: int
     user_id: int
     page: object
-    mode: str  # "external" | "easy_apply" | "indeed_apply"
+    mode: str  # "external" | "easy_apply" | "indeed_apply" | "ats" (multi-page company portal: Workday, iCIMS, ...)
     resume_key: str | None
     frame: object | None = None
     fields: list[dict] = dc_field(default_factory=list)
@@ -70,7 +100,7 @@ class FormSession:
     @property
     def stepped(self) -> bool:
         """Multi-step flows where the agent presses Continue/Next itself (never the final Submit)."""
-        return self.mode in ("easy_apply", "indeed_apply")
+        return self.mode in ("easy_apply", "indeed_apply", "ats")
 
     async def _target_frame(self):
         if self.mode == "indeed_apply":
@@ -95,8 +125,17 @@ class FormSession:
                 return scope
         return frame.locator("body")
 
-    async def _button(self, frame, *, aria: str | None, text: re.Pattern):
+    async def _button(self, frame, *, aria: str | None, text: re.Pattern, css: str | None = None):
         scope = await self._scope(frame)
+        if css:
+            loc = scope.locator(css)
+            for i in range(min(await loc.count(), 4)):
+                try:
+                    btn = loc.nth(i)
+                    if await btn.is_visible() and text.search((await btn.inner_text()).strip() or (await btn.get_attribute("aria-label") or "")):
+                        return btn
+                except Exception:
+                    continue
         if aria:
             loc = scope.locator(f'button[aria-label="{aria}"]')
             if await loc.count() > 0 and await loc.first.is_visible():
@@ -119,6 +158,8 @@ class FormSession:
             if await self._submit_button(frame) is not None:
                 return None
             return await self._button(frame, aria=None, text=INDEED_NEXT_PATTERN)
+        if self.mode == "ats":
+            return await self._button(frame, aria=None, text=ATS_NEXT_PATTERN, css=ATS_NEXT_CSS)
         if self.mode != "easy_apply":
             return None
         return (await self._button(frame, aria="Continue to next step", text=NEXT_PATTERN)
@@ -127,13 +168,16 @@ class FormSession:
     async def _back_button(self, frame):
         if not self.stepped:
             return None
-        return await self._button(frame, aria="Back to previous step", text=re.compile(r"^\s*(back|previous)\b", re.I))
+        return await self._button(frame, aria="Back to previous step", text=re.compile(r"^\s*(back|previous)\b", re.I),
+                                  css=ATS_BACK_CSS if self.mode == "ats" else None)
 
     async def _submit_button(self, frame):
         if self.mode == "easy_apply":
             return await self._button(frame, aria="Submit application", text=re.compile(r"submit application", re.I))
         if self.mode == "indeed_apply":
             return await self._button(frame, aria=None, text=re.compile(r"submit (your )?application", re.I))
+        if self.mode == "ats":
+            return await self._button(frame, aria=None, text=ATS_SUBMIT_PATTERN, css=ATS_NEXT_CSS)
         scope = frame.locator("body")
         typed = scope.locator('button[type="submit"]:visible, input[type="submit"]:visible')
         if await typed.count() > 0:
@@ -189,14 +233,49 @@ class FormSession:
         }
 
     # ---- actions -------------------------------------------------------------
+    async def _expand_sections(self, user: User, log) -> None:
+        """Company portals: click "Add" under Work Experience / Education until there is one entry per job / degree in your profile."""
+        if self.mode != "ats":
+            return
+        from app.services.applicant_profile import structured_profile
+
+        profile = await structured_profile(user)
+        want = {"experience": min(len(profile.get("experience") or []), 6), "education": min(len(profile.get("education") or []), 4)}
+        frame = await self._target_frame()
+        added: dict[str, int] = {}
+        stuck: set[str] = set()
+        for _ in range(12):
+            try:
+                sections = await frame.evaluate(SECTIONS_JS)
+            except Exception:
+                return
+            # Entries are counted from their "Work Experience 2" headings; if a site has none, count our own clicks.
+            todo = next((s for s in sections if s["add"] and s["kind"] not in stuck
+                         and (s["entries"] or added.get(s["kind"], 0)) < want.get(s["kind"], 0)), None)
+            if todo is None:
+                break
+            await _click(frame.locator(f'[data-section-add="{todo["kind"]}"]').first)
+            await frame.wait_for_timeout(1200)
+            added[todo["kind"]] = added.get(todo["kind"], 0) + 1
+            after = next((s for s in await frame.evaluate(SECTIONS_JS) if s["kind"] == todo["kind"]), None)
+            if after is None or (todo["entries"] > 0 and after["entries"] <= todo["entries"]):
+                stuck.add(todo["kind"])
+        if added:
+            await log("action", "Added " + ", ".join(f"{n} {k} entr{'y' if n == 1 else 'ies'}" for k, n in added.items())
+                      + " to match your profile.", data={"wanted": want})
+
     async def _autofill_current(self, user: User, job, log) -> dict:
+        from app.services.agent_assist import clear_human_checks
+
+        await clear_human_checks(self.page, log, f"on step {self.step}")
+        await self._expand_sections(user, log)
         frame = await self._target_frame()
         self.fields = await collect_fields(frame, self.root)
         await log("info", f"{self.flow_name} step {self.step}: found {len(self.fields)} fields." if self.stepped else f"Form: found {len(self.fields)} fields.",
                   data={"labels": [f.get("label") for f in self.fields][:40], "step": self.step})
         # LinkedIn restores values from the user's browser profile. Treat those values as
         # candidates too: they still need to be checked against the saved application profile.
-        values, self.mapping = await resolve_values(self.fields, user, job, self.notes, recheck_all=True)
+        values, self.mapping = await resolve_values(self.fields, user, job, self.notes, recheck_all=True, protect=self.user_keys)
         filled, errors = await fill_fields(frame, self.fields, values)
         self.ai_keys |= set(filled)
         self.last_errors = errors
@@ -252,14 +331,23 @@ class FormSession:
         button = await self._next_button(frame)
         if button is None:
             return False, await self.snapshot()
+        from app.services.agent_assist import clear_human_checks
+
+        if await clear_human_checks(self.page, log, f"before “Next” on step {self.step}"):
+            frame = await self._target_frame()
+            button = await self._next_button(frame)
+            if button is None:
+                return False, await self.snapshot()
         label = (await button.inner_text()).strip() or "Next"
         before = await self._signature(frame)
-        await button.click(timeout=5000)
+        await _click(button)
         try:
             await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
         except Exception:
             pass
         await self.page.wait_for_timeout(1500)
+        if await clear_human_checks(self.page, log, f"after “{label}”"):
+            await self.page.wait_for_timeout(1500)
         frame = await self._target_frame()
         after = await self._signature(frame)
         if after == before:
@@ -298,7 +386,7 @@ class FormSession:
 
     @property
     def flow_name(self) -> str:
-        return {"easy_apply": "Easy Apply", "indeed_apply": "Indeed Apply"}.get(self.mode, "Form")
+        return {"easy_apply": "Easy Apply", "indeed_apply": "Indeed Apply", "ats": "Company portal"}.get(self.mode, "Form")
 
     async def instruct(self, instruction: str, user: User, job, log) -> dict:
         """Your free-text instruction -> AI clicks / fills on this tab, then a fresh snapshot."""
@@ -309,14 +397,14 @@ class FormSession:
             self.fields = await collect_fields(frame, self.root)
         scope = await resolve_root(frame, self.root) if self.root else None
         self.notes.append(instruction)
-        result = await run_instruction(self, frame, scope, instruction, user, job, log)
+        result = await run_instruction(self, frame, scope, instruction, user, job, log, max_rounds=12 if self.stepped else 5)
         frame = await self._target_frame()
+        # What you asked to change is yours now: later autofill / recheck passes never overwrite it.
         self.user_keys |= set(result.get("filled_keys") or [])
-        if any(d.startswith("went ") for d in result.get("done") or []):
-            # We moved between steps: re-fill anything the site dropped, using your notes + profile.
-            snap = await self._autofill_current(user, job, log)
-            self.user_keys |= set(result.get("filled_keys") or [])
-            return snap
+        if any(d.startswith(("went ", "clicked ")) for d in result.get("done") or []):
+            # We moved to another step (Back / an "Edit" link on the review page). Do NOT re-autofill this step — that
+            # could undo your fix; instruct_form() then presses Next through the remaining steps back to the review page.
+            await log("info", "Fixed what you asked; moving forward again to the review page.", data={"step": self.step})
         try:
             await self.page.wait_for_load_state("domcontentloaded", timeout=8000)
         except Exception:
@@ -360,10 +448,15 @@ class FormSession:
         button = await self._submit_button(frame)
         if button is None:
             return False, snap, "No submit button found on this step."
+        from app.services.agent_assist import clear_human_checks
+
+        await clear_human_checks(self.page, log, "before submitting")
         before_url = self.page.url
-        await button.click(timeout=5000)
+        await _click(button)
         await log("action", "Clicked Submit.", data={"url": before_url})
         await self.page.wait_for_timeout(4000)
+        if await clear_human_checks(self.page, log, "after Submit"):
+            await self.page.wait_for_timeout(4000)  # invisible CAPTCHAs submit by themselves once solved
         text = ""
         try:
             # inner_text through Playwright also reads LinkedIn's shadow-DOM dialog content.

@@ -159,3 +159,23 @@ def list_resumes(username: str) -> list[dict[str, str]]:
     except Exception:
         return []
     return resumes
+
+
+def read_structured_profile(username: str) -> dict | None:
+    """Cached structured (JSON) version of profile.md + details.md, used to fill long ATS forms."""
+    import json
+
+    try:
+        data = _client().storage.from_(settings.supabase_storage_bucket).download(_key(username, "Profile", "structured.json"))
+        value = json.loads(data.decode("utf-8"))
+        return value if isinstance(value, dict) else None
+    except Exception:
+        return None
+
+
+def save_structured_profile(username: str, data: dict) -> str:
+    import json
+
+    key = _key(username, "Profile", "structured.json")
+    _upload(key, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"), "application/json")
+    return key

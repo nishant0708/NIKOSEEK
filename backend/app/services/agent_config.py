@@ -140,3 +140,70 @@ def get_indeed_login(user: User) -> tuple[str, str]:
     if not isinstance(encrypted, str) or not encrypted:
         raise ValueError("Add your Indeed password on the Profile page before applying.")
     return email.strip(), decrypt_secret(encrypted)
+
+
+# ---------------------------------------------------------------------------
+# Company job portals (Workday, Greenhouse, iCIMS, ...): ONE email + password you chose for job-application
+# accounts. The agent signs up with it the first time a company asks, then remembers that this company
+# (vendor + tenant, e.g. workday: {hp: true}) already has an account and signs in next time.
+#   agent_config["ats"]          = {"email", "password_encrypted", "password_hash"}
+#   agent_config["ats_accounts"] = {"workday": {"hp": true, "nvidia": true}, "icims": {...}}
+# ---------------------------------------------------------------------------
+def _ats_config(user: User) -> dict:
+    ats = (user.agent_config or {}).get("ats")
+    return dict(ats) if isinstance(ats, dict) else {}
+
+
+def ats_accounts(user: User) -> dict[str, dict[str, bool]]:
+    accounts = (user.agent_config or {}).get("ats_accounts")
+    return {v: dict(t) for v, t in accounts.items() if isinstance(t, dict)} if isinstance(accounts, dict) else {}
+
+
+def ats_public_payload(user: User) -> dict:
+    ats = _ats_config(user)
+    email = ats.get("email")
+    return {
+        "email": email.strip() if isinstance(email, str) else "",
+        "password_set": bool(ats.get("password_encrypted")),
+        "accounts": ats_accounts(user),
+    }
+
+
+def set_ats_credentials(user: User, email: str, password: str | None) -> None:
+    config = fresh_config(user)
+    ats = dict(config.get("ats")) if isinstance(config.get("ats"), dict) else {}
+    ats["email"] = email.strip()
+    if password:
+        ats["password_hash"] = hash_password(password)
+        ats["password_encrypted"] = encrypt_secret(password)
+    config["ats"] = ats
+    save_config(user, config)
+
+
+def get_ats_login(user: User) -> tuple[str, str] | None:
+    ats = _ats_config(user)
+    email, encrypted = ats.get("email"), ats.get("password_encrypted")
+    if not isinstance(email, str) or not email.strip() or not isinstance(encrypted, str) or not encrypted:
+        return None
+    return email.strip(), decrypt_secret(encrypted)
+
+
+def ats_account_known(user: User, vendor: str, tenant: str) -> bool:
+    return bool(ats_accounts(user).get(vendor, {}).get(tenant))
+
+
+def mark_ats_account(user: User, vendor: str, tenant: str, signed_up: bool = True) -> None:
+    """Remember (and commit right away) that this company's portal already has an account for you."""
+    config = fresh_config(user)
+    accounts = dict(config.get("ats_accounts")) if isinstance(config.get("ats_accounts"), dict) else {}
+    tenants = dict(accounts.get(vendor)) if isinstance(accounts.get(vendor), dict) else {}
+    if signed_up:
+        tenants[tenant] = True
+    else:
+        tenants.pop(tenant, None)
+    accounts[vendor] = tenants
+    config["ats_accounts"] = accounts
+    save_config(user, config)
+    db = object_session(user)
+    if db is not None:
+        db.commit()

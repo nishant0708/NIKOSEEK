@@ -22,6 +22,7 @@ from app.services.storage import download_file, read_details_markdown, read_prof
 logger = logging.getLogger(__name__)
 
 ASK_USER = "ASK_USER"
+MAX_OPTIONS = 400  # long dropdowns (countries + dial codes are ~250) must be read completely
 MAX_COMBOBOX_PROBES = 15
 
 # Used by the navigator to decide "is there a form on this page" (text-like inputs only).
@@ -46,6 +47,7 @@ FIELD_KEY_PATTERNS: list[tuple[tuple[str, ...], str]] = [
 ]
 
 COLLECT_FIELDS_JS = r"""(scopeEl) => {
+  const MAX_OPTIONS = 400;
   // scopeEl is an element resolved by Playwright (it may live inside LinkedIn's shadow DOM), or null for the whole page.
   const scope = scopeEl || document;
   const doc = scope.getRootNode ? scope.getRootNode() : document;
@@ -86,33 +88,88 @@ COLLECT_FIELDS_JS = r"""(scopeEl) => {
     const invalid = node.getAttribute('aria-invalid') === 'true';
     let text = invalid ? (byIds(node, 'aria-errormessage') || hintOf(node)) : '';
     if (!text) {
-      const box = node.closest('fieldset, .fb-dash-form-element, .jobs-easy-apply-form-element, [class*="question"], [class*="field"]') || node.parentElement;
-      const err = box && box.querySelector('.artdeco-inline-feedback--error, [class*="error"]:not(input), [role="alert"]');
+      const box = node.closest('fieldset, .fb-dash-form-element, .jobs-easy-apply-form-element, [data-automation-id^="formField"], [class*="question"], [class*="field"]') || node.parentElement;
+      const err = box && box.querySelector('.artdeco-inline-feedback--error, [data-automation-id="errorMessage"], [class*="error"]:not(input), [role="alert"]');
       text = err ? clean(err.innerText || err.textContent) : '';
     }
     if (!text && node.validity && !node.validity.valid && !node.validity.valueMissing) text = node.validationMessage || '';
     return text || (invalid ? 'Invalid value' : '');
   };
-  // Visible text of one radio option. LinkedIn radios often have no value attribute (value="on"),
-  // so the option text must come from its label / aria / neighbouring text.
-  const optionText = (node, index) => {
-    const cands = [];
-    if (node.labels) for (const l of node.labels) { cands.push(l.innerText); cands.push(l.textContent); }
-    cands.push(node.getAttribute('aria-label'));
-    cands.push(byIds(node, 'aria-labelledby'));
-    if (node.nextElementSibling) cands.push(node.nextElementSibling.textContent);
-    if (node.parentElement && node.parentElement.querySelectorAll('input').length === 1) cands.push(node.parentElement.textContent);
-    for (const c of cands) { const t = clean(c); if (t && t.length <= 150) return t; }
+  // Candidate texts for one radio option, by source. LinkedIn radios often have no value (value="on") and some
+  // markups put the QUESTION in the radio's own label / aria-label, so the right source is chosen per GROUP
+  // (the one whose texts are distinct and differ from the question) after all options are seen.
+  const SOURCES = ['label', 'aria', 'labelledby', 'next', 'own', 'value'];
+  const optionCands = (node) => {
+    const c = {};
+    if (node.labels && node.labels.length) c.label = node.labels[node.labels.length - 1].innerText || node.labels[0].textContent;
+    c.aria = node.getAttribute('aria-label');
+    c.labelledby = byIds(node, 'aria-labelledby');
+    c.next = node.nextElementSibling ? node.nextElementSibling.textContent : '';
+    // The biggest ancestor that holds ONLY this radio (its "row"): its text is the option text.
+    let row = node.parentElement, best = null;
+    while (row && row !== scope && row.querySelectorAll('input[type="radio"]').length === 1) { best = row; row = row.parentElement; }
+    c.own = best ? (best.innerText || best.textContent) : '';
     const v = node.getAttribute('value');
-    return v && v !== 'on' ? v : `Option ${index + 1}`;
+    c.value = v && v !== 'on' ? v : '';
+    for (const k of SOURCES) c[k] = clean(c[k]);
+    return c;
+  };
+  const stripQuestion = (text, question) => {
+    let t = text;
+    const q = clean(question).replace(/\s*\*$/, '');
+    if (q && t.toLowerCase().startsWith(q.toLowerCase())) t = clean(t.slice(q.length));
+    if (q && t.toLowerCase().endsWith(q.toLowerCase())) t = clean(t.slice(0, t.length - q.length));
+    return t.replace(/^[\s*:\-–]+/, '').trim();
+  };
+  const resolveOptions = (group) => {
+    const q = clean(group.label).toLowerCase().replace(/\s*\*$/, '');
+    const cands = group._cands.map(c => { const o = {}; for (const k of SOURCES) o[k] = stripQuestion(c[k] || '', group.label); return o; });
+    const ok = t => t && t.length <= 150 && t.toLowerCase().replace(/\s*\*$/, '') !== q;
+    for (const k of SOURCES) {
+      const texts = cands.map(o => o[k]);
+      if (texts.every(ok) && new Set(texts.map(t => t.toLowerCase())).size === texts.length) return texts;
+    }
+    // No clean source: best text per option (even if it repeats the question, e.g. a lone "Nishant_Resume.pdf" radio).
+    return cands.map((o, i) => SOURCES.map(k => o[k]).find(ok)
+      || SOURCES.map(k => group._cands[i][k]).find(t => t && t.length <= 150) || `Option ${i + 1}`);
   };
   const isRequired = (node, label) => node.required || node.getAttribute('aria-required') === 'true' || /\*\s*$|\(required\)/i.test(label);
 
   const out = [];
   const radioGroups = new Map();
-  const nodes = deepAll(scope, 'input, textarea, select');
+  // Repeated sections (Workday "Work Experience 2", "Education 1"): the section title tells the AI which entry a field belongs to.
+  const sectionOf = (node) => {
+    const g = node.closest('[role="group"][aria-labelledby], [data-automation-id^="workExperience-"], [data-automation-id^="education-"]');
+    if (!g) return '';
+    const t = byIds(g, 'aria-labelledby') || clean((g.querySelector('h3, h4, h5, legend, [role="heading"]') || {}).innerText || '');
+    return t.slice(0, 80);
+  };
+  // Workday date parts (Month / Day / Year spin buttons) carry only "Month" as their label: prefix the field label ("From").
+  const dateLabel = (node, label) => {
+    const wrap = node.closest('[data-automation-id^="formField"]') || node.closest('fieldset') || (node.closest('[data-automation-id="dateInputWrapper"]') || node).parentElement;
+    const outer = wrap && wrap.querySelector('label, legend');
+    const part = (node.getAttribute('data-automation-id') || '').match(/dateSection(Month|Day|Year)/);
+    const head = outer ? clean(outer.innerText) : '';
+    const name = part ? part[1] : (node.getAttribute('aria-label') || label);
+    return head && !head.toLowerCase().includes(String(name).toLowerCase()) ? `${head} (${name})` : (head || name);
+  };
+  const nodes = deepAll(scope, 'input, textarea, select, button[aria-haspopup="listbox"]');
   for (const node of nodes) {
     const tag = node.tagName.toLowerCase();
+    if (tag === 'button') {
+      // Workday-style dropdown: a button that opens a listbox. Options are probed in Python.
+      if (!vis(node) || node.disabled) continue;
+      const key = 'f' + out.length;
+      node.setAttribute('data-fill-key', key);
+      const label = labelOf(node);
+      const text = clean(node.innerText || node.value);
+      const field = { key, tag, type: 'listbox', kind: 'listbox', name: node.getAttribute('name'), id: node.id || '', label,
+        required: isRequired(node, label), error: errorOf(node), hint: hintOf(node), options: null,
+        value: /^(select one|select|choose|--)/i.test(text) ? '' : text };
+      const sec = sectionOf(node); if (sec) field.group = sec;
+      out.push(field);
+      continue;
+    }
     const type = (node.getAttribute('type') || (tag === 'input' ? 'text' : tag)).toLowerCase();
     if (['hidden', 'submit', 'button', 'file', 'password', 'image', 'reset', 'search'].includes(type)) continue;
     const shown = vis(node) || (node.labels && [...node.labels].some(vis));
@@ -123,22 +180,23 @@ COLLECT_FIELDS_JS = r"""(scopeEl) => {
       let group = radioGroups.get(name);
       if (!group) {
         const label = groupLabel(node) || labelOf(node);
-        group = { key: 'f' + out.length, kind: 'radio', tag, type, name, id: '', label, required: isRequired(node, label) || !!node.closest('fieldset[aria-required="true"]'), options: [], value: '', error: errorOf(node) };
+        group = { key: 'f' + out.length, kind: 'radio', tag, type, name, id: '', label, required: isRequired(node, label) || !!node.closest('fieldset[aria-required="true"]'), options: [], value: '', error: errorOf(node), _cands: [], _checked: -1 };
         radioGroups.set(name, group);
         out.push(group);
       }
-      const optLabel = optionText(node, group.options.length);
       if (node.required || node.getAttribute('aria-required') === 'true') group.required = true;
       node.setAttribute('data-fill-key', group.key);
-      node.setAttribute('data-fill-option', String(group.options.length));
-      group.options.push(optLabel);
-      if (node.checked) group.value = optLabel;
+      node.setAttribute('data-fill-option', String(group._cands.length));
+      group._cands.push(optionCands(node));
+      if (node.checked) group._checked = group._cands.length - 1;
       continue;
     }
 
     const key = 'f' + out.length;
     node.setAttribute('data-fill-key', key);
-    const label = type === 'checkbox' ? (clean((node.labels && node.labels[0] && node.labels[0].innerText) || '') || labelOf(node)) : labelOf(node);
+    const spin = node.getAttribute('role') === 'spinbutton' || /^dateSection/.test(node.getAttribute('data-automation-id') || '');
+    let label = type === 'checkbox' ? (clean((node.labels && node.labels[0] && node.labels[0].innerText) || '') || labelOf(node)) : labelOf(node);
+    if (spin) label = dateLabel(node, label);
     const field = {
       key, tag, type, name: node.getAttribute('name'), id: node.id || '',
       placeholder: node.getAttribute('placeholder'), autocomplete: node.getAttribute('autocomplete'),
@@ -146,31 +204,51 @@ COLLECT_FIELDS_JS = r"""(scopeEl) => {
       inputmode: node.getAttribute('inputmode'), pattern: node.getAttribute('pattern'),
       min: node.getAttribute('min'), max: node.getAttribute('max'), maxlength: node.getAttribute('maxlength'),
       kind: tag === 'select' ? 'select' : tag === 'textarea' ? 'textarea' : type === 'checkbox' ? 'checkbox'
-        : (node.getAttribute('role') === 'combobox' || node.getAttribute('aria-autocomplete') === 'list' || node.closest('[class*="select__control"]')) ? 'combobox' : 'text',
+        : (node.getAttribute('role') === 'combobox' || node.getAttribute('aria-autocomplete') === 'list' || node.closest('[class*="select__control"]')
+           || node.getAttribute('data-uxi-widget-type') === 'selectinput') ? 'combobox' : 'text',
     };
+    if (spin) field.spin = true;
+    if (node.getAttribute('data-uxi-widget-type') === 'selectinput') field.prompt = true;
+    const section = sectionOf(node);
+    if (section && !field.group) field.group = section;
     if (field.kind === 'select') {
       const opts = [...node.options];
-      field.options = opts.filter(o => o.value !== '' && !/^\s*(select|choose|--)/i.test(o.textContent)).map(o => clean(o.textContent)).filter(Boolean).slice(0, 100);
+      field.options = opts.filter(o => o.value !== '' && !/^\s*(select|choose|--)/i.test(o.textContent)).map(o => clean(o.textContent)).filter(Boolean).slice(0, MAX_OPTIONS);
       const sel = node.selectedOptions && node.selectedOptions[0];
       field.value = sel && sel.value !== '' && !/^\s*(select|choose|--)/i.test(sel.textContent) ? clean(sel.textContent) : '';
     } else if (field.kind === 'checkbox') {
       field.options = ['Yes', 'No'];
       field.value = node.checked ? 'Yes' : (field.required ? '' : 'No');
       const g = groupLabel(node);
-      if (g && g !== label) field.group = g;
+      if (g && g !== label && !field.group) field.group = g;
     } else if (field.kind === 'combobox') {
-      const box = node.closest('[class*="select__control"], [class*="container"]');
-      const chosen = box && box.querySelector('[class*="single-value"], [class*="singleValue"]');
-      field.value = clean(node.value) || (chosen ? clean(chosen.innerText) : '');
+      // react-select (Greenhouse, Lever ...): the chosen value sits in the CONTROL, a sibling of the input's own
+      // "select__input-container" — so look from the control, never from the nearest "*container*".
+      const box = node.closest('[class*="select__control"], [class*="-control"]')
+        || node.closest('[class*="select__container"], [class*="select-shell"]')
+        || node.closest('[class*="container"]:not([class*="input-container"]):not([class*="value-container"])');
+      const single = box && box.querySelector('[class*="single-value"], [class*="singleValue"]');
+      const multi = box ? [...box.querySelectorAll('[class*="multi-value__label"], [class*="multiValue"] > div:first-child')].map(m => clean(m.innerText)).filter(Boolean) : [];
+      const chosen = single || (multi.length ? { innerText: multi.join(', ') } : null);
+      // Workday multiselect prompts show chosen items as pills next to the (empty) search input.
+      const wdBox = node.closest('[data-automation-id="multiselectInputContainer"], [data-automation-id^="formField"]');
+      const pills = wdBox ? [...wdBox.querySelectorAll('[data-automation-id="selectedItem"], [data-automation-id="promptSelectionLabel"]')].map(p => clean(p.innerText)).filter(Boolean) : [];
+      field.value = clean(node.value) || (chosen ? clean(chosen.innerText) : '') || pills.join(', ');
     } else {
       field.value = node.value || '';
     }
     out.push(field);
   }
+  for (const group of radioGroups.values()) {
+    group.options = resolveOptions(group);
+    group.value = group._checked >= 0 ? group.options[group._checked] : '';
+    delete group._cands; delete group._checked;
+  }
   return out.slice(0, 100);
 }"""
 
-OPTION_SELECTOR = '[role="option"]:visible, [class*="select__option"]:visible'
+OPTION_SELECTOR = ('[role="option"]:visible, [class*="select__option"]:visible, [data-automation-id="promptOption"]:visible, '
+                   '[data-automation-id="menuItem"]:visible')
 DIALOG_HINT = re.compile(r"apply to|easy apply|contact info|resume|submit application|review your application|additional questions", re.I)
 
 
@@ -209,17 +287,7 @@ def profile_answers(username: str) -> dict[str, str]:
     phone = re.search(r"(\+?\d[\d\s().-]{8,}\d)", text)
     if phone:
         answers["phone"] = re.sub(r"\s+", " ", phone.group(1)).strip()
-    notice = re.search(
-        r"(?:notice\s*period|available\s*to\s*join|availability)[^\n]*?"
-        r"(\d+(?:\.\d+)?)\s*(days?|weeks?|months?)",
-        text,
-        re.I,
-    )
-    if notice:
-        amount = float(notice.group(1))
-        unit = notice.group(2).lower()
-        days = amount * {"day": 1, "days": 1, "week": 7, "weeks": 7, "month": 30, "months": 30}[unit]
-        answers["notice_period"] = str(int(days)) if days.is_integer() else str(days)
+    answers.update(profile_answers_from_text(text))
     linkedin = re.search(r"https?://(?:www\.)?linkedin\.com/\S+", text, re.I)
     if linkedin:
         answers["linkedin"] = linkedin.group(0).rstrip(").,")
@@ -227,6 +295,24 @@ def profile_answers(username: str) -> dict[str, str]:
     if summary:
         answers["summary"] = " ".join(summary.group(1).split())[:2000]
     return {key: value for key, value in answers.items() if value}
+
+
+def profile_answers_from_text(text: str) -> dict[str, str]:
+    """Explicit notice period ("notice period: 30 days", "can join in 2 weeks", "immediate joiner" -> 0) in days."""
+    notice = re.search(
+        r"(?:notice\s*period|available\s*to\s*join|availability|join\s*(?:in|within|after))[^\n]*?"
+        r"(\d+(?:\.\d+)?)\s*(days?|weeks?|months?)",
+        text,
+        re.I,
+    )
+    if notice:
+        amount = float(notice.group(1))
+        unit = notice.group(2).lower().rstrip("s")
+        days = amount * {"day": 1, "week": 7, "month": 30}[unit]
+        return {"notice_period": str(int(days)) if days.is_integer() else str(days)}
+    if re.search(r"immediate(ly)?\s*joiner|join\s*immediately|notice\s*period\W{0,5}(none|nil|0\b|immediate)", text, re.I):
+        return {"notice_period": "0"}
+    return {}
 
 
 def _field_haystack(field: dict) -> str:
@@ -260,7 +346,7 @@ def _fields_for_llm(fields: list[dict]) -> list[dict]:
 
 # Prefilled choice fields are re-checked too: LinkedIn defaults "Phone country code" to the first option
 # (e.g. "Andorra (+376)"), which looks filled but is wrong.
-RECHECK_KINDS = ("select", "combobox", "radio")
+RECHECK_KINDS = ("select", "combobox", "radio", "listbox")
 KEEP = "KEEP"
 
 
@@ -336,7 +422,10 @@ async def collect_fields(frame, root: str | None = None) -> list[dict]:
         fields = await frame.evaluate(COLLECT_FIELDS_JS, None)
     probes = 0
     for field in fields:
-        if field["kind"] != "combobox" or probes >= MAX_COMBOBOX_PROBES:
+        if field["kind"] == "listbox":
+            await _probe_listbox(frame, field)
+            continue
+        if field["kind"] != "combobox" or field.get("prompt") or probes >= MAX_COMBOBOX_PROBES:
             continue
         probes += 1
         locator = frame.locator(f'[data-fill-key="{field["key"]}"]').first
@@ -344,20 +433,62 @@ async def collect_fields(frame, root: str | None = None) -> list[dict]:
             await locator.click(timeout=2000)
             await frame.wait_for_timeout(400)
             options = [text.strip() for text in await frame.locator(OPTION_SELECTOR).all_inner_texts() if text.strip()]
-            field["options"] = options[:100] or None
+            field["options"] = options[:MAX_OPTIONS] or None
             await locator.press("Escape")
         except Exception:
             field["options"] = None
     return fields
 
 
-async def resolve_values(fields: list[dict], user: User, job, notes: list[str] | None = None, *, recheck_all: bool = False) -> tuple[dict[str, str], str]:
+async def _probe_listbox(frame, field: dict) -> None:
+    """Workday-style dropdown button: open it, read the options, close it again."""
+    locator = frame.locator(f'[data-fill-key="{field["key"]}"]').first
+    try:
+        await _click(locator)
+        await frame.wait_for_timeout(500)
+        texts = [t.strip() for t in await frame.locator('[role="listbox"]:visible [role="option"]').all_inner_texts()]
+        field["options"] = [t for t in texts if t and not re.match(r"^(select one|select|choose)$", t, re.I)][:MAX_OPTIONS] or None
+        await frame.page.keyboard.press("Escape")
+        await frame.wait_for_timeout(200)
+    except Exception:
+        field["options"] = None
+
+
+async def _click(locator, timeout: int = 5000) -> None:
+    """Click, coping with overlays that intercept pointer events (Workday puts a click_filter div over its buttons)."""
+    try:
+        await locator.click(timeout=timeout)
+    except Exception:
+        try:
+            await locator.click(timeout=timeout, force=True)
+        except Exception:
+            await locator.evaluate("el => el.click()")
+
+
+async def resolve_values(fields: list[dict], user: User, job, notes: list[str] | None = None, *, recheck_all: bool = False,
+                         protect: set[str] | None = None) -> tuple[dict[str, str], str]:
+    """`protect`: keys the applicant set themselves on this step — never overwritten (not even by the fixed rules below)."""
+    protect = protect or set()
+    fields = [f for f in fields if f["key"] not in protect]
     resolved, mode = await _resolve_values(fields, user, job, notes, recheck_all=recheck_all)
     answers = await asyncio.to_thread(profile_answers, user.username)
+    if notes:
+        # A notice period you told the agent ("I can join in 30 days") wins over the profile.
+        told = profile_answers_from_text("\n".join(notes)).get("notice_period")
+        if told:
+            answers["notice_period"] = told
     for field in fields:
         if re.search(r"notice\s*period|available\s*to\s*join|availability", field.get("label", ""), re.I):
-            if answers.get("notice_period"):
-                resolved[field["key"]] = answers["notice_period"]
+            days = answers.get("notice_period")
+            if field.get("options"):
+                # Dropdown / radio: pick the option for the stated number of days, else leave it for the applicant.
+                option = _notice_option(field["options"], days) if days else None
+                if option:
+                    resolved[field["key"]] = option
+                else:
+                    resolved.pop(field["key"], None)
+            elif days:
+                resolved[field["key"]] = days
             else:
                 # Never infer a notice period from a generic model rule. Clear
                 # any browser-prefilled/model value so the applicant is asked.
@@ -381,7 +512,7 @@ async def resolve_values(fields: list[dict], user: User, job, notes: list[str] |
         # example Andorra) when the profile identifies the applicant's country.
         if fix:
             resolved[field["key"]] = fix
-    return resolved, mode
+    return {k: v for k, v in resolved.items() if k not in protect}, mode
 
 
 async def _resolve_values(fields: list[dict], user: User, job, notes: list[str] | None = None, *, recheck_all: bool = False) -> tuple[dict[str, str], str]:
@@ -390,7 +521,10 @@ async def _resolve_values(fields: list[dict], user: User, job, notes: list[str] 
     if not empty:
         return {}, "none"
     answers = await asyncio.to_thread(profile_answers, user.username)
+    from app.services.applicant_profile import structured_block, structured_profile  # local import: avoid a cycle
+
     profile = await asyncio.to_thread(profile_text, user.username)
+    profile += structured_block(await structured_profile(user))
     profile += f"\n\nToday's date: {date.today().isoformat()}"
     if notes:
         # Things you told the agent during this application ("immediate joiner, CTC 10 LPA ...").
@@ -408,11 +542,13 @@ async def _resolve_values(fields: list[dict], user: User, job, notes: list[str] 
             value = str(value).strip()
             if not value or value in (ASK_USER, KEEP) or value == (field.get("value") or "").strip():
                 continue
-            if field.get("options") and field["kind"] in ("select", "radio", "checkbox"):
+            if field.get("options") and field["kind"] in ("select", "radio", "checkbox", "listbox"):
                 match = _match_option(field["options"], value)
                 if match is None:
                     continue
                 value = match
+            elif field.get("options") and field["kind"] == "combobox":
+                value = _match_option(field["options"], value) or value  # searchable: keep the text if not listed
             resolved[key] = value
         return resolved, "llm"
     except Exception as exc:
@@ -475,13 +611,43 @@ def country_option(field: dict, country: str | None) -> str | None:
     return country if field.get("kind") in ("text", "combobox", "select") else None
 
 
-def _match_option(options: list[str], value: str) -> str | None:
-    wanted = value.strip().lower()
+def _notice_option(options: list[str], days: str) -> str | None:
+    n = float(days)
     for option in options:
-        if option.strip().lower() == wanted:
+        low = option.lower()
+        if n == 0 and re.search(r"immediate|0\s*days?|none", low):
             return option
-    for option in options:
-        if wanted and (wanted in option.lower() or option.lower() in wanted):
+        nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", low)]
+        if not nums:
+            continue
+        scale = 30 if "month" in low else 7 if "week" in low else 1
+        values = [x * scale for x in nums]
+        if (len(values) == 1 and values[0] == n) or (len(values) >= 2 and values[0] <= n <= values[1]):
+            return option
+        if re.search(r"less than|within|up to|upto|<", low) and n <= values[0]:
+            return option
+    return None
+
+
+def _match_option(options: list[str], value: str) -> str | None:
+    """Best option for `value`: exact > starts with it ("India +91") > whole word inside > substring.
+    So "India" never picks "British Indian Ocean Territory"."""
+    wanted = value.strip().lower()
+    if not wanted:
+        return None
+    lowered = [(option, option.strip().lower()) for option in options]
+    for option, low in lowered:
+        if low == wanted:
+            return option
+    for option, low in lowered:
+        if low.startswith(wanted) and not low[len(wanted):len(wanted) + 1].isalnum():
+            return option
+    word = re.compile(rf"(?<![a-z0-9]){re.escape(wanted)}(?![a-z0-9])")
+    for option, low in lowered:
+        if word.search(low):
+            return option
+    for option, low in lowered:
+        if wanted in low or (len(low) > 1 and low in wanted):
             return option
     return None
 
@@ -504,6 +670,42 @@ async def set_field_value(frame, field: dict, value: str) -> None:
             await radio.check(force=True, timeout=5000)
         return
     locator = frame.locator(f'[data-fill-key="{key}"]').first
+    if kind == "listbox":
+        await _click(locator)
+        await frame.wait_for_timeout(500)
+        options = frame.locator('[role="listbox"]:visible [role="option"]')
+        texts = [t.strip() for t in await options.all_inner_texts()]
+        option = _match_option(texts, value)
+        if option is None:
+            await frame.page.keyboard.press("Escape")
+            raise ValueError(f"'{value}' is not one of the options of {field.get('label') or key}")
+        target = options.nth(texts.index(option))
+        await target.scroll_into_view_if_needed(timeout=3000)
+        await _click(target)
+        await frame.wait_for_timeout(400)
+        return
+    if field.get("spin"):
+        # Date-part spin buttons ignore fill(): click and type the digits.
+        await _click(locator)
+        await locator.press("Control+a")
+        await locator.press_sequentially(re.sub(r"\D", "", value) or value, delay=60)
+        return
+    if field.get("prompt"):
+        # Workday multiselect prompt: type, Enter to search, pick the matching option.
+        await _click(locator)
+        await locator.fill("")
+        await locator.press_sequentially(value, delay=40)
+        await locator.press("Enter")
+        await frame.wait_for_timeout(1500)
+        options = frame.locator(OPTION_SELECTOR)
+        texts = [t.strip() for t in await options.all_inner_texts()]
+        option = _match_option(texts, value) or (texts[0] if len(texts) == 1 else None)
+        if option is None:
+            await locator.press("Escape")
+            raise ValueError(f"No option matching '{value}' for {field.get('label') or key}")
+        await _click(options.nth(texts.index(option)))
+        await frame.wait_for_timeout(500)
+        return
     if kind == "checkbox":
         want = value.strip().lower() in ("yes", "true", "1", "checked", "y")
         if want != await locator.is_checked():
@@ -550,12 +752,11 @@ async def set_field_value(frame, field: dict, value: str) -> None:
         await locator.press_sequentially(value, delay=60)
         await frame.wait_for_timeout(1200)
         options = frame.locator(OPTION_SELECTOR)
-        count = await options.count()
-        for i in range(min(count, 50)):
-            text = (await options.nth(i).inner_text()).strip()
-            if text.lower() == value.lower() or value.lower() in text.lower():
-                await options.nth(i).click(timeout=3000)
-                return
+        texts = [t.strip() for t in await options.all_inner_texts()]
+        best = _match_option(texts, value)
+        if best is not None:
+            await options.nth(texts.index(best)).click(timeout=3000)
+            return
         await locator.press("ArrowDown")
         await locator.press("Enter")
         return
