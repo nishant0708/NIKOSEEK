@@ -126,35 +126,130 @@ async def _button_by_text(frame, pattern: re.Pattern):
 # ---------------------------------------------------------------------------
 # Start screens
 # ---------------------------------------------------------------------------
-WORKDAY_START = [
-    ('[data-automation-id="legalNoticeAcceptButton"]', "Accepted the cookie notice."),
-    ('[data-automation-id="adventureButton"]', "Clicked Apply on the Workday job page."),
-]
+# Workday's "Start Your Application" box. Its options, by data-automation-id (text as fallback).
+START_OPTIONS = {
+    "last": ('[data-automation-id="useMyLastApplication"]', re.compile(r"^\s*use my last application\s*$", re.I), "Use My Last Application"),
+    "resume": ('[data-automation-id="autofillWithResume"]', re.compile(r"^\s*autofill with resume\s*$", re.I), "Autofill with Resume"),
+    "manual": ('[data-automation-id="applyManually"]', re.compile(r"^\s*apply manually\s*$", re.I), "Apply Manually"),
+}
+WORKDAY_READY = ('[data-automation-id="adventureButton"], [data-automation-id="applyManually"], [data-automation-id="autofillWithResume"], '
+                 '[data-automation-id="useMyLastApplication"], [data-automation-id="email"], [data-automation-id="file-upload-input-ref"], '
+                 '[data-automation-id="pageFooterNextButton"], [data-automation-id="bottom-navigation-next-button"], input[type="password"]')
+# A click that does not change the page is retried at most this often (the old code clicked Apply 12 times).
+MAX_SAME_CLICK = 2
+_clicks: dict[int, tuple[str, str, int]] = {}  # id(page) -> (url, action, times)
+
+
+def _again(page, action: str) -> bool:
+    """True if `action` may run (again) on this page; counts repeats on the same URL."""
+    url, last, times = _clicks.get(id(page), ("", "", 0))
+    times = times + 1 if (url == page.url and last == action) else 1
+    _clicks[id(page)] = (page.url, action, times)
+    return times <= MAX_SAME_CLICK
+
+
+async def _start_option(frame, key: str):
+    css, pattern, _ = START_OPTIONS[key]
+    return await _first_visible(frame, [css]) or await _button_by_text(frame, pattern)
+
+
+def _start_order(user: User, vendor: str, tenant: str, has_resume: bool) -> list[str]:
+    """Which "Start Your Application" option to take:
+    * this company already knows you (ats_accounts[workday][tenant]) -> Use My Last Application: everything you
+      entered there last time comes back pre-filled
+    * otherwise Autofill with Resume (Workday reads your CV into the form), then Apply Manually as the fallback."""
+    order = ["last"] if ats_account_known(user, vendor, tenant) else []
+    order += ["resume"] if has_resume else []
+    return order + ["manual", "resume", "last"]
+
+
+async def _upload_resume_step(page, log) -> bool:
+    """Workday's "Autofill with Resume" page: only a file drop zone + Continue. Upload the CV and continue."""
+    from app.services.form_filler import upload_resume
+
+    frame = page.main_frame
+    drop = await _first_visible(frame, ['[data-automation-id="file-upload-drop-zone"]', '[data-automation-id="select-files"]'])
+    file_input = frame.locator('input[type="file"]')
+    if await file_input.count() == 0 or (drop is None and not await _visible(frame.locator('[data-automation-id="file-upload-input-ref"]'))):
+        return False
+    texts = await frame.locator('input[type="text"]:visible, input:not([type]):visible, textarea:visible').count()
+    nxt = await _first_visible(frame, ['[data-automation-id="pageFooterNextButton"]', '[data-automation-id="bottom-navigation-next-button"]'])
+    if texts > 1 or nxt is None:
+        return False  # a real form page with a resume field: the form filler handles it
+    application = getattr(log, "application", None)
+    uploaded = await _visible(frame.locator('[data-automation-id="file-upload-successful"], [data-automation-id="delete-file"]'))
+    if not uploaded:
+        if not _again(page, "upload"):
+            return False
+        name = await upload_resume(frame, getattr(application, "resume_key", None), application.user.username if application else "applicant")
+        if not name:
+            return False
+        await log("action", f"Uploaded your resume ({name}) for Workday's autofill.", data={"url": page.url})
+        for _ in range(20):  # Workday parses the CV before Continue works
+            await page.wait_for_timeout(1000)
+            if await _visible(frame.locator('[data-automation-id="file-upload-successful"], [data-automation-id="delete-file"]')):
+                break
+    if not _again(page, "continue-after-upload"):
+        return False
+    await _click(nxt)
+    await page.wait_for_timeout(3000)
+    await log("action", "Continued — Workday pre-fills the application from your resume.", data={"url": page.url})
+    return True
+
+
+WIZARD_MARKERS = ('[data-automation-id="pageFooterNextButton"], [data-automation-id="bottom-navigation-next-button"], '
+                  '[data-automation-id="progressBar"], [data-automation-id="progressBarActiveStep"]')
+
+
+async def in_application_wizard(page) -> bool:
+    """Workday's application has started (URL .../apply/..., a Continue/Next footer or progress bar, no sign-in form).
+    From here every page — resume upload, My Information, questions, Review — is handled by the page-by-page filler,
+    so the navigator never has to ask the AI (or you) what to click."""
+    vendor, _ = portal_key(page.url)
+    if vendor != "workday" or "/apply" not in (page.url or ""):
+        return False
+    if await _auth_kind(page) is not None:
+        return False
+    return await _visible(page.main_frame.locator(WIZARD_MARKERS))
 
 
 async def ats_prepare(page, user: User, log) -> bool:
-    """One click through a portal's start screens (Apply / Apply Manually / Sign in with email). True if it clicked."""
+    """One step through a portal's start screens. True if it did something (the caller then re-checks the page).
+    Workday: cookie notice -> Start Your Application choice (it opens ON TOP of the job page, whose Apply button
+    stays visible, so the choice is checked BEFORE Apply) -> Apply -> resume upload page."""
     vendor, tenant = portal_key(page.url)
     frame = page.main_frame
     if vendor == "workday":
-        for selector, message in WORKDAY_START:
-            button = await _first_visible(frame, [selector])
-            if button is not None:
-                await _click(button)
-                await page.wait_for_timeout(2500)
-                await log("action", message, data={"url": page.url, "portal": f"{vendor}/{tenant}"})
-                return True
-        # "Start Your Application": reuse the last application when this company already knows you.
-        last = await _first_visible(frame, ['[data-automation-id="useMyLastApplication"]'])
-        manual = await _first_visible(frame, ['[data-automation-id="applyManually"]'])
-        choice = last if (last is not None and ats_account_known(user, vendor, tenant)) else manual
-        if choice is None:
-            choice = await _button_by_text(frame, re.compile(r"^\s*apply manually\s*$", re.I))
-        if choice is not None:
-            label = "Use My Last Application" if choice is last else "Apply Manually"
-            await _click(choice)
+        try:  # Workday renders with JavaScript: wait until it has drawn something we know
+            await frame.wait_for_selector(WORKDAY_READY, state="visible", timeout=12000)
+        except Exception:
+            pass
+        cookie = await _first_visible(frame, ['[data-automation-id="legalNoticeAcceptButton"]'])
+        if cookie is not None and _again(page, "cookie"):
+            await _click(cookie)
+            await page.wait_for_timeout(1500)
+            await log("action", "Accepted the cookie notice.", data={"url": page.url})
+            return True
+        options = {key: await _start_option(frame, key) for key in START_OPTIONS}
+        if any(options.values()):
+            application = getattr(log, "application", None)
+            for key in _start_order(user, vendor, tenant, bool(getattr(application, "resume_key", None))):
+                if options.get(key) is not None and _again(page, f"start:{key}"):
+                    label = START_OPTIONS[key][2]
+                    reason = {"last": f"you already have an account at {tenant}, so your last application is reused",
+                              "resume": "Workday fills the form from your resume", "manual": "fallback"}[key]
+                    await _click(options[key])
+                    await page.wait_for_timeout(3000)
+                    await log("action", f"Chose “{label}” on Workday's start screen ({reason}).", data={"url": page.url, "portal": f"{vendor}:{tenant}"})
+                    return True
+            return False
+        if await _upload_resume_step(page, log):
+            return True
+        apply = await _first_visible(frame, ['[data-automation-id="adventureButton"]'])
+        if apply is not None and _again(page, "apply"):
+            await _click(apply)
             await page.wait_for_timeout(2500)
-            await log("action", f"Chose “{label}” on Workday's start screen.", data={"url": page.url})
+            await log("action", "Clicked Apply on the Workday job page.", data={"url": page.url, "portal": f"{vendor}:{tenant}"})
             return True
     email_first = await _first_visible(frame, ['[data-automation-id="SignInWithEmailButton"]'])
     if email_first is None and await _auth_kind(page) is None:

@@ -1,12 +1,12 @@
-import { useEffect, useMemo, useState, useRef } from 'react';
+import { useEffect, useMemo, useState, useRef, type ReactNode } from 'react';
 import { Background, Controls, MarkerType, ReactFlow, type Edge, type Node } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import {
-  LoaderCircle, Network, Radio, RefreshCw, Workflow as WorkflowIcon,
+  LoaderCircle, Radio, Workflow as WorkflowIcon,
   ChevronDown, ChevronRight, AlertTriangle, Eye, X,
-  Brain, MousePointerClick, Info, CircleAlert, Flag, Crosshair, CircleHelp
+  Brain, MousePointerClick, Info, CircleAlert, Flag, Crosshair, CircleHelp,
+  Bell, BriefcaseBusiness, ExternalLink, Maximize2, Minimize2, MonitorPlay, ListChecks, Inbox,
 } from 'lucide-react';
-import { Button } from '../components/ui/button';
 import { ApplicationFormPanel } from '../components/workflow/ApplicationFormPanel';
 import { StatusActions } from '../components/workflow/StatusActions';
 import { LiveBrowserPanel } from '../components/workflow/LiveBrowserPanel';
@@ -17,7 +17,7 @@ import { api, type AgentEvent, type AgentStageKey, type Application, type Browse
 const STAGE_NODES = [
   { id: 'open', label: 'Opening job page', detail: 'Open the posting in your {provider} window.' },
   { id: 'login', label: 'Checking {provider} login', detail: 'Reuse the connected session; if it expired, finish login there.' },
-  { id: 'find', label: 'Finding apply button', detail: 'Easy Apply / Indeed Apply, or AI picks Apply → company site. Stuck? It asks you.' },
+  { id: 'find', label: 'Finding apply button', detail: 'Easy Apply / Indeed Apply, or Apply → company site (Workday & co: sign up / sign in for you). Stuck? It asks you.' },
   { id: 'fields', label: 'Filling the form', detail: 'AI fills what your profile answers (Easy Apply: step by step) + resume.' },
   { id: 'review', label: 'Your answers & submit', detail: 'Fill the missing answers below, then press Submit.' },
 ] as const;
@@ -91,22 +91,19 @@ function tokensOf(event: AgentEvent) {
   return tokens?.total ? `${formatTokens(tokens.total)} tok (${formatTokens(tokens.input)} in / ${formatTokens(tokens.output)} out)` : '';
 }
 
-function AgentLogPanel({ events, live, application }: { events: AgentEvent[]; live: boolean; application: Application }) {
+
+function AgentLogPanel({ events, live, application, height }: { events: AgentEvent[]; live: boolean; application: Application; height: number }) {
   const runTokens = events.reduce((sum, event) => sum + (((event.data?.tokens as { total?: number } | undefined)?.total) ?? 0), 0);
   const list = useRef<HTMLDivElement>(null);
   // Scroll only the log box (scrollIntoView would also scroll the whole page).
   useEffect(() => { if (list.current) list.current.scrollTop = list.current.scrollHeight; }, [events.length]);
   return (
-    <div className="rounded-[2rem] border border-[#EBCDAA] bg-[#FFF9F0] p-5">
-      <div className="flex items-center justify-between">
-        <h3 className="flex items-center gap-2 text-lg font-black text-ink"><Brain size={18} className="text-orange" /> Agent log</h3>
-        <div className="flex items-center gap-3 text-xs font-bold">
-          <span className="rounded-full bg-[#F4ECFF] px-2.5 py-1 text-[#7A3FB8]" title="This attempt / all attempts of this job">AI: {formatTokens(runTokens)} tokens this run · {formatTokens(application.llm_total_tokens)} total ({application.llm_calls ?? 0} calls)</span>
-          {live && <span className="flex items-center gap-2 text-[#8B4E23]"><LoaderCircle size={13} className="animate-spin" /> running</span>}
-        </div>
+    <div>
+      <div className="flex flex-wrap items-center gap-2 text-xs font-bold">
+        <span className="rounded-full bg-[#F4ECFF] px-2.5 py-1 text-[#7A3FB8]" title="This attempt / all attempts of this job">AI: {formatTokens(runTokens)} tokens this run · {formatTokens(application.llm_total_tokens)} total ({application.llm_calls ?? 0} calls)</span>
+        {live && <span className="flex items-center gap-2 text-[#8B4E23]"><LoaderCircle size={13} className="animate-spin" /> running</span>}
       </div>
-      <p className="mt-1 text-xs text-[#805940]">What the agent saw, what it decided and why — saved for every attempt.</p>
-      <div ref={list} className="mt-4 max-h-[420px] space-y-2 overflow-y-auto pr-1">
+      <div ref={list} style={{ maxHeight: height }} className="mt-3 space-y-2 overflow-y-auto pr-1">
         {!events.length && <p className="rounded-xl border border-dashed border-[#EBCDAA] bg-white p-4 text-sm font-bold text-[#805940]">No log yet for this job.</p>}
         {events.map((event, index) => {
           const kind = KIND_STYLE[event.kind] ?? KIND_STYLE.info;
@@ -138,103 +135,104 @@ function stageLabel(application?: Application | null) {
   return application.stage || 'Queued';
 }
 
-function QueueCategory({ 
-  title, 
-  applications, 
-  selectedId, 
-  onSelect, 
-  onRetry,
-  onStatus,
-  defaultCollapsed = false
-}: { 
-  title: string;
-  applications: Application[];
-  selectedId: number | null;
-  onSelect: (app: Application) => void;
-  onRetry: (app: Application) => Promise<void> | void;
-  onStatus: (app: Application, status: ManualStatus) => Promise<void>;
-  defaultCollapsed?: boolean;
+function newestFirst(apps: Application[]) {
+  const t = (a: Application) => Date.parse(a.created_at ?? '') || 0;
+  return [...apps].sort((a, b) => t(b) - t(a) || b.id - a.id);
+}
+
+function timeAgo(value?: string | null) {
+  const ms = Date.now() - (Date.parse(value ?? '') || Date.now());
+  const m = Math.round(ms / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  return h < 24 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
+}
+
+const STATUS_DOT: Record<string, string> = {
+  HUMAN_REVIEW_REQUIRED: '#E2711D', IN_PROGRESS: '#2E6BB8', PENDING: '#C9A27E', FAILED: '#AD3212',
+  SUBMITTED: '#347233', COMPLETED: '#347233', REJECTED: '#6B4329',
+};
+
+/** One status group in the queue sidebar — collapsed until you open it; newest job first. */
+function QueueGroup({ title, applications, selectedId, onSelect, alert }: {
+  title: string; applications: Application[]; selectedId: number | null; onSelect: (app: Application) => void; alert?: boolean;
 }) {
-  const [collapsed, setCollapsed] = useState(defaultCollapsed);
-  if (applications.length === 0) return null;
-
-  const isCompact = applications.length >= 5;
-
+  const [open, setOpen] = useState(false);
+  if (!applications.length) return null;
   return (
-    <div className="space-y-2 mt-4">
-      <div 
-        className="flex items-center gap-2 cursor-pointer select-none"
-        onClick={() => setCollapsed(!collapsed)}
-      >
-        {collapsed ? <ChevronRight size={16} className="text-[#A16A45]" /> : <ChevronDown size={16} className="text-[#A16A45]" />}
-        <h3 className="text-xs font-black uppercase tracking-[.14em] text-[#A16A45] flex items-center gap-2">
-          {title}
-          <span className="bg-[#EBCDAA] text-white px-2 py-0.5 rounded-full text-[10px]">{applications.length}</span>
-        </h3>
-      </div>
-      
-      {!collapsed && (
-        <div className="space-y-3 pl-2 border-l-2 border-[#EBCDAA]">
+    <div className="rounded-2xl border border-[#EBCDAA] bg-white">
+      <button type="button" onClick={() => setOpen(v => !v)} className="flex w-full items-center gap-2 px-3 py-2.5 text-left">
+        {open ? <ChevronDown size={15} className="text-[#A16A45]" /> : <ChevronRight size={15} className="text-[#A16A45]" />}
+        <span className="flex-1 text-xs font-black uppercase tracking-[.12em] text-[#82512D]">{title}</span>
+        {alert && <span className="h-2 w-2 rounded-full bg-[#E2711D]" />}
+        <span className="rounded-full bg-[#FFE4C8] px-2 py-0.5 text-[11px] font-black text-[#82512D]">{applications.length}</span>
+      </button>
+      {open && (
+        <div className="space-y-1 border-t border-[#F3DFC8] p-1.5">
           {applications.map(application => {
             const active = selectedId === application.id;
-            const badgeClass =
-              application.status === 'SUBMITTED' || application.status === 'COMPLETED'
-                ? 'bg-[#347233] text-white'
-                : application.status === 'REJECTED'
-                ? 'bg-[#6B4329] text-white'
-                : application.status === 'HUMAN_REVIEW_REQUIRED'
-                ? 'bg-[#DDF4D5] text-[#347233]'
-                : application.status === 'FAILED'
-                  ? 'bg-[#FFE1D6] text-[#AD3212]'
-                  : application.status === 'IN_PROGRESS'
-                    ? 'bg-[#FFE4C8] text-[#8B4E23]'
-                    : 'bg-[#FFF0DE] text-[#8B4E23]';
-            
-            if (isCompact) {
-              return (
-                <div 
-                  key={application.id}
-                  onClick={() => onSelect(application)}
-                  className={`flex items-center justify-between p-2 rounded-lg cursor-pointer transition ${active ? 'bg-[#FFF4E7] border border-orange shadow-sm' : 'bg-white border border-[#EBCDAA] hover:bg-[#FFF9F0]'}`}
-                >
-                  <div className="min-w-0 flex-1 mr-2">
-                    <p className="truncate text-xs font-bold text-ink">{application.job.title ?? 'Untitled job'}</p>
-                    <p className="truncate text-[10px] text-[#805940]">{application.job.company}</p>
-                  </div>
-                  <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[9px] font-black uppercase tracking-[.12em] ${badgeClass}`}>
-                    {application.status.replace(/_/g, ' ')}
-                  </span>
-                </div>
-              );
-            }
-
             return (
-              <article 
-                key={application.id}
-                onClick={() => onSelect(application)}
-                className={`rounded-2xl border bg-white p-4 cursor-pointer transition ${active ? 'border-orange shadow-[0_0_0_6px_rgba(245,106,34,0.12)]' : 'border-[#EBCDAA] hover:bg-[#FFF9F0]'}`}
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <h3 className="truncate font-black text-ink">{application.job.title ?? 'Untitled job'}</h3>
-                    <p className="mt-1 text-sm text-[#805940]">{application.job.company} · {application.job.location}</p>
-                  </div>
-                  <span className={`rounded-full px-2 py-1 text-[10px] font-black uppercase tracking-[.12em] ${badgeClass}`}>{application.status.replace(/_/g, ' ')}</span>
-                </div>
-                <p className="mt-3 text-sm font-bold text-[#875D42]">{stageLabel(application)}</p>
-                <div className="mt-3 flex flex-wrap gap-2 text-xs font-bold text-[#805940]">
-                  <span className="rounded-full bg-[#FFF4E7] px-3 py-1">Resume: {application.resume_role ?? 'unknown'}</span>
-                  <span className="rounded-full bg-[#FFF4E7] px-3 py-1">Queue #{application.queue_position}</span>
-                  {(application.llm_total_tokens ?? 0) > 0 && <span className="rounded-full bg-[#F4ECFF] px-3 py-1 text-[#7A3FB8]">{formatTokens(application.llm_total_tokens)} tokens · {application.llm_calls} AI calls</span>}
-                </div>
-                <div className="mt-3"><StatusActions application={application} onRetry={onRetry} onStatus={onStatus} /></div>
-              </article>
+              <button type="button" key={application.id} onClick={() => onSelect(application)}
+                className={`flex w-full items-start gap-2 rounded-xl px-2.5 py-2 text-left transition ${active ? 'bg-[#FFF0DE] ring-1 ring-orange' : 'hover:bg-[#FFF9F0]'}`}>
+                <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full" style={{ background: STATUS_DOT[application.status] ?? '#C9A27E' }} />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[13px] font-bold text-ink">{application.job.title ?? 'Untitled job'}</span>
+                  <span className="block truncate text-[11px] text-[#805940]">{application.job.company} · {timeAgo(application.created_at)}</span>
+                </span>
+                {application.pending_question && <Bell size={13} className="mt-1 shrink-0 text-[#E2711D]" />}
+              </button>
             );
           })}
         </div>
       )}
     </div>
   );
+}
+
+type TileMode = 'normal' | 'expanded' | 'collapsed';
+const TILE_KEY = 'nikoseek.liveTiles';
+// Default layout: Job details and Agent log full width; Live flow and Live browser side by side under them.
+const DEFAULT_TILES: Record<string, TileMode> = { details: 'expanded', log: 'expanded', flow: 'normal', browser: 'normal' };
+
+function readTiles(): Record<string, TileMode> {
+  try { return JSON.parse(window.localStorage.getItem(TILE_KEY) ?? '{}') as Record<string, TileMode>; } catch { return {}; }
+}
+
+/** A small box on the job view; expand it to full width / taller, or collapse it to its title. */
+function Tile({ title, icon, mode, onMode, right, children }: {
+  title: string; icon: ReactNode; mode: TileMode; onMode: (mode: TileMode) => void; right?: ReactNode; children: ReactNode;
+}) {
+  return (
+    <div className={`min-w-0 overflow-hidden rounded-[1.5rem] border border-[#EBCDAA] bg-[#FFF9F0] ${mode === 'expanded' ? 'xl:col-span-2' : ''}`}>
+      <div className="flex items-center gap-2 border-b border-[#F3DFC8] px-4 py-2.5">
+        <button type="button" onClick={() => onMode(mode === 'collapsed' ? 'normal' : 'collapsed')} className="flex min-w-0 flex-1 items-center gap-2 text-left">
+          {mode === 'collapsed' ? <ChevronRight size={15} className="text-[#A16A45]" /> : <ChevronDown size={15} className="text-[#A16A45]" />}
+          <span className="text-orange">{icon}</span>
+          <span className="truncate font-black text-ink">{title}</span>
+        </button>
+        {right}
+        {mode !== 'collapsed' && (
+          <button type="button" title={mode === 'expanded' ? 'Make smaller' : 'Expand'} onClick={() => onMode(mode === 'expanded' ? 'normal' : 'expanded')}
+            className="rounded-full p-1.5 text-[#82512D] hover:bg-[#FFE4C8]">{mode === 'expanded' ? <Minimize2 size={14} /> : <Maximize2 size={14} />}</button>
+        )}
+      </div>
+      {mode !== 'collapsed' && <div className="p-4">{children}</div>}
+    </div>
+  );
+}
+
+function Detail({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-[10px] font-black uppercase tracking-[.12em] text-[#A16A45]">{label}</dt>
+      <dd className="mt-0.5 break-words text-sm font-bold text-[#542914]">{children}</dd>
+    </div>
+  );
+}
+
+function fmtDate(value?: string | null) {
+  return value ? new Date(value).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : '—';
 }
 
 export function LiveWorkflow({ token }: { token: string }) {
@@ -348,9 +346,12 @@ export function LiveWorkflow({ token }: { token: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
-  const activeApplication = applications.find(application => application.status === 'IN_PROGRESS')
-    ?? applications.find(application => application.status === 'PENDING')
+  // A question can belong to a later queued application while an older application is
+  // still running. Follow the application that needs the user before queue order.
+  const activeApplication = applications.find(application => application.pending_question)
     ?? applications.find(application => application.status === 'HUMAN_REVIEW_REQUIRED')
+    ?? applications.find(application => application.status === 'IN_PROGRESS')
+    ?? applications.find(application => application.status === 'PENDING')
     ?? null;
 
   // null = "follow live": always show whatever job the worker is on right now.
@@ -483,6 +484,26 @@ export function LiveWorkflow({ token }: { token: string }) {
   }
 
 
+  const [tiles, setTiles] = useState<Record<string, TileMode>>(readTiles);
+  const tileMode = (id: string) => tiles[id] ?? DEFAULT_TILES[id] ?? 'normal';
+  const setTile = (id: string) => (mode: TileMode) => setTiles(current => {
+    const next = { ...current, [id]: mode };
+    try { window.localStorage.setItem(TILE_KEY, JSON.stringify(next)); } catch { /* private mode */ }
+    return next;
+  });
+  const needsYou = newestFirst(applications.filter(a => a.status === 'HUMAN_REVIEW_REQUIRED' || (a.pending_question && a.status !== 'HUMAN_REVIEW_REQUIRED')));
+  const groups: { title: string; apps: Application[]; alert?: boolean }[] = [
+    { title: 'Human review', apps: needsYou, alert: needsYou.some(a => a.pending_question) },
+    { title: 'In progress', apps: newestFirst(inProgressApplications.filter(a => !a.pending_question)) },
+    { title: 'Queued', apps: newestFirst(queuedApplications) },
+    { title: 'Failed', apps: newestFirst(failedApplications) },
+    { title: 'Submitted', apps: newestFirst(submittedApplications) },
+    { title: 'Completed', apps: newestFirst(completedApplications) },
+    { title: 'Rejected', apps: newestFirst(rejectedApplications) },
+  ];
+  const job = selectedApp?.job;
+  const formUrl = selectedApp?.application_url;
+
   return (
     <>
       <style>{`
@@ -491,194 +512,139 @@ export function LiveWorkflow({ token }: { token: string }) {
           70% { box-shadow: 0 0 0 15px rgba(245, 106, 34, 0); }
           100% { box-shadow: 0 0 0 0 rgba(245, 106, 34, 0); }
         }
-        @keyframes pulseEdge {
-          0% { opacity: 1; }
-          50% { opacity: 0.3; }
-          100% { opacity: 1; }
-        }
         @keyframes slideIn {
           from { transform: translateY(-100%); opacity: 0; }
           to { transform: translateY(0); opacity: 1; }
         }
       `}</style>
-      
+
       {toast && (
         <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-[#FFF0DE] border border-orange shadow-lg rounded-full px-6 py-3 flex items-center gap-3 text-sm font-bold text-[#8B4E23]" style={{ animation: 'slideIn 0.3s ease-out' }}>
           {toast.message}
-          <button onClick={() => setToast(null)} className="ml-2 text-[#8B4E23] hover:text-orange">
-            <X size={14} />
-          </button>
+          <button onClick={() => setToast(null)} className="ml-2 text-[#8B4E23] hover:text-orange"><X size={14} /></button>
         </div>
       )}
 
-      <main className="min-h-screen bg-cream px-5 py-9">
-        <section className="mx-auto max-w-7xl">
-          <p className="flex items-center gap-2 text-xs font-black uppercase tracking-[.16em] text-orange"><Network size={15} /> Live workflow</p>
-          <h1 className="mt-2 text-4xl font-black">Queue, status, and retries</h1>
-          <p className="mt-3 max-w-2xl text-[#805940]">Watch each job live: the agent opens the posting in your LinkedIn or Indeed window, reaches the application form (Easy Apply, Indeed Apply or the company site), fills it from your profile and hands it to you to review and submit. You can watch and click in the live browser view, answer its questions, and every AI decision is logged.</p>
-
-          <div className="mt-7 grid gap-6 lg:grid-cols-[minmax(0,1.2fr)_380px]">
-            <div className="flex flex-col gap-6">
-              {selectedApp?.pending_question && <AgentQuestionCard token={token} application={selectedApp} onUpdated={upsertApplication} />}
-
-              {selectedApp?.status === 'HUMAN_REVIEW_REQUIRED' && (
-                <div className="bg-[#FFF0EB] border border-[#E9A38E] rounded-xl p-4 flex items-center justify-between shadow-sm">
-                  <div className="flex items-center gap-3">
-                    <AlertTriangle className="text-[#AD3212]" size={20} />
-                    <div>
-                      <p className="font-bold text-[#AD3212]">{selectedApp.stage}</p>
-                      <p className="text-sm text-[#AD3212]/80">{selectedApp.job.title} is open in the {provider} browser window. Answer the missing fields in “Application form” below and submit from here — or do it directly in the browser.</p>
-                    </div>
-                  </div>
-                  {selectedApp.application_url && (
-                    <a 
-                      href={selectedApp.application_url} 
-                      target="_blank" 
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-2 bg-[#AD3212] text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-[#8B280F] transition"
-                    >
-                      <Eye size={16} />
-                      Open form URL
-                    </a>
-                  )}
-                </div>
-              )}
-
-              <div className="overflow-hidden rounded-[2rem] border border-[#EBCDAA] bg-[#FFF9F0]">
-                <div className="flex items-center justify-between border-b border-[#EBCDAA] px-5 py-4">
-                  <div className="flex items-center gap-2">
-                    <WorkflowIcon className="text-orange" size={18} />
-                    <p className="font-black text-ink">Live application flow</p>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {selectedApp && <span className="hidden max-w-[260px] truncate text-xs font-bold text-[#805940] sm:inline">{selectedApp.job.title} · {selectedApp.job.company}</span>}
-                    {selectedApp && <StatusActions application={selectedApp} onRetry={retryApplication} onStatus={changeStatus} size="xs" />}
-                    {!following && (
-                      <button type="button" onClick={() => setSelectedApplicationId(null)} className="inline-flex items-center gap-1 rounded-full bg-[#FFE4C8] px-3 py-1 text-xs font-bold text-[#82512D] hover:bg-[#FFD7AE]">
-                        <Crosshair size={13} /> Follow live
-                      </button>
-                    )}
-                    <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-bold ${connected ? 'bg-[#DDF4D5] text-[#347233]' : 'bg-[#FFE1D6] text-[#AD3212]'}`}>
-                      <Radio size={13} /> {connected ? 'Live' : 'Reconnecting'}
-                    </span>
-                  </div>
-                </div>
-                <div className="h-[720px] overflow-hidden bg-[radial-gradient(circle_at_1px_1px,rgba(245,106,34,0.10)_1px,transparent_0)] bg-[length:24px_24px]">
-                  <ReactFlow
-                    key={`${selectedApp?.id ?? 'none'}-${nodes.length}`}
-                    nodes={nodes}
-                    edges={flowEdges}
-                    fitView
-                    fitViewOptions={{ padding: 0.18, minZoom: 0.55, maxZoom: 1.15 }}
-                    nodesDraggable={false}
-                    nodesConnectable={false}
-                    elementsSelectable={false}
-                    panOnDrag={false}
-                    defaultEdgeOptions={{ type: 'smoothstep' }}
-                    proOptions={{ hideAttribution: true }}
-                  >
-                    <Background color="#E6B98B" gap={18} size={1} />
-                    <Controls showInteractive={false} />
-                  </ReactFlow>
-                </div>
+      <main className="min-h-screen bg-cream px-5 py-7">
+        <div className="mx-auto flex max-w-[1500px] flex-col gap-6 lg:flex-row">
+          <aside className="lg:sticky lg:top-24 lg:h-[calc(100vh-7.5rem)] lg:w-80 lg:shrink-0 lg:overflow-y-auto">
+            <div className="rounded-[1.75rem] border border-[#EBCDAA] bg-[#FFF9F0] p-3">
+              <div className="flex items-center gap-2 px-2 pb-2 pt-1">
+                <ListChecks size={16} className="text-orange" />
+                <p className="flex-1 text-sm font-black text-ink">Queue</p>
+                <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-bold ${connected ? 'bg-[#DDF4D5] text-[#347233]' : 'bg-[#FFE1D6] text-[#AD3212]'}`}>
+                  <Radio size={11} /> {connected ? 'Live' : 'Reconnecting'}
+                </span>
               </div>
-
-              {watchId && selectedApp && <LiveBrowserPanel token={token} applicationId={selectedApp.id} frame={browserFrame} provider={provider} />}
-
-              {selectedApp && <AgentLogPanel events={events} live={isRunning} application={selectedApp} />}
-
-              {selectedApp && ['HUMAN_REVIEW_REQUIRED', 'SUBMITTED', 'COMPLETED', 'REJECTED', 'FAILED'].includes(selectedApp.status) && (
-                <ApplicationFormPanel token={token} application={selectedApp} onUpdated={upsertApplication} />
+              {!following && (
+                <button type="button" onClick={() => setSelectedApplicationId(null)} className="mb-2 flex w-full items-center justify-center gap-1 rounded-xl bg-[#FFE4C8] px-3 py-1.5 text-xs font-bold text-[#82512D] hover:bg-[#FFD7AE]">
+                  <Crosshair size={13} /> Follow the live job
+                </button>
               )}
-              {selectedApp?.status === 'HUMAN_REVIEW_REQUIRED' && (selectedApp.form_data as { session_open?: boolean } | undefined)?.session_open !== false && (
-                <InstructAgent token={token} application={selectedApp} onUpdated={upsertApplication} />
-              )}
-            </div>
-
-            <aside className="rounded-[2rem] border border-[#EBCDAA] bg-[#FFF9F0] p-5 max-h-[calc(100vh-200px)] overflow-y-auto">
-              <div className="flex items-center gap-2">
-                <LoaderCircle className="text-orange" size={18} />
-                <h2 className="text-xl font-black">Queue</h2>
-              </div>
-              <p className="mt-2 text-sm text-[#805940]">Queued jobs, active jobs, failed jobs, and retry actions.</p>
-              
-              <div className="mt-4">
-                <QueueCategory 
-                  title="In progress" 
-                  applications={inProgressApplications} 
-                  selectedId={selectedApp?.id ?? null}
-                  onSelect={(app) => setSelectedApplicationId(app.id)}
-                  onRetry={retryApplication}
-                  onStatus={changeStatus}
-                />
-                
-                <QueueCategory 
-                  title="Human review required" 
-                  applications={reviewApplications} 
-                  selectedId={selectedApp?.id ?? null}
-                  onSelect={(app) => setSelectedApplicationId(app.id)}
-                  onRetry={retryApplication}
-                  onStatus={changeStatus}
-                />
-                
-                <QueueCategory 
-                  title="Queued" 
-                  applications={queuedApplications} 
-                  selectedId={selectedApp?.id ?? null}
-                  onSelect={(app) => setSelectedApplicationId(app.id)}
-                  onRetry={retryApplication}
-                  onStatus={changeStatus}
-                  defaultCollapsed={queuedApplications.length >= 10}
-                />
-                
-                <QueueCategory
-                  title="Submitted"
-                  applications={submittedApplications}
-                  selectedId={selectedApp?.id ?? null}
-                  onSelect={(app) => setSelectedApplicationId(app.id)}
-                  onRetry={retryApplication}
-                  onStatus={changeStatus}
-                  defaultCollapsed={submittedApplications.length >= 5}
-                />
-
-                <QueueCategory
-                  title="Completed"
-                  applications={completedApplications}
-                  selectedId={selectedApp?.id ?? null}
-                  onSelect={(app) => setSelectedApplicationId(app.id)}
-                  onRetry={retryApplication}
-                  onStatus={changeStatus}
-                  defaultCollapsed={completedApplications.length >= 5}
-                />
-
-                <QueueCategory
-                  title="Rejected"
-                  applications={rejectedApplications}
-                  selectedId={selectedApp?.id ?? null}
-                  onSelect={(app) => setSelectedApplicationId(app.id)}
-                  onRetry={retryApplication}
-                  onStatus={changeStatus}
-                  defaultCollapsed
-                />
-
-                <QueueCategory 
-                  title="Failed" 
-                  applications={failedApplications} 
-                  selectedId={selectedApp?.id ?? null}
-                  onSelect={(app) => setSelectedApplicationId(app.id)}
-                  onRetry={retryApplication}
-                  onStatus={changeStatus}
-                />
-
+              <div className="space-y-2">
+                {groups.map(group => (
+                  <QueueGroup key={group.title} title={group.title} applications={group.apps} alert={group.alert}
+                    selectedId={selectedApp?.id ?? null} onSelect={app => setSelectedApplicationId(app.id)} />
+                ))}
                 {!applications.length && (
-                  <div className="mt-4 rounded-2xl border border-dashed border-[#EBCDAA] bg-white p-5 text-sm font-bold text-[#805940]">
-                    No applications have been queued yet. Use Apply selected from Jobs to start the worker.
+                  <div className="rounded-2xl border border-dashed border-[#EBCDAA] bg-white p-4 text-sm font-bold text-[#805940]">
+                    Nothing queued yet. Use Apply selected on the Jobs page.
                   </div>
                 )}
               </div>
-            </aside>
-          </div>
-        </section>
+            </div>
+          </aside>
+
+          <section className="min-w-0 flex-1 space-y-4">
+            {!selectedApp ? (
+              <div className="grid min-h-[50vh] place-items-center rounded-[2rem] border border-dashed border-[#EBCDAA] bg-[#FFF9F0] p-10 text-center">
+                <div><Inbox className="mx-auto text-orange" /><p className="mt-3 font-black text-ink">Pick a job from the queue</p><p className="mt-1 text-sm text-[#805940]">Its details, agent log, live flow and live browser open here.</p></div>
+              </div>
+            ) : (
+              <>
+                <div className="rounded-[1.75rem] border border-[#EBCDAA] bg-[#FFF9F0] p-5">
+                  <div className="flex flex-wrap items-start gap-3">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-[11px] font-black uppercase tracking-[.14em] text-orange">{following ? 'Following the live job' : 'Selected job'}</p>
+                      <h1 className="mt-1 truncate text-2xl font-black text-ink">{job?.title ?? 'Untitled job'}</h1>
+                      <p className="mt-0.5 text-sm text-[#805940]">{job?.company} · {job?.location}</p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="rounded-full px-2.5 py-1 text-[10px] font-black uppercase tracking-[.12em] text-white" style={{ background: STATUS_DOT[selectedApp.status] ?? '#C9A27E' }}>{selectedApp.status.replace(/_/g, ' ')}</span>
+                      <StatusActions application={selectedApp} onRetry={retryApplication} onStatus={changeStatus} size="xs" />
+                    </div>
+                  </div>
+                  <p className="mt-3 rounded-xl bg-white px-3 py-2 text-sm font-bold text-[#875D42]">{stageLabel(selectedApp)}</p>
+                </div>
+
+                {selectedApp.pending_question && <AgentQuestionCard token={token} application={selectedApp} onUpdated={upsertApplication} />}
+
+                {isReview && (
+                  <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#E9A38E] bg-[#FFF0EB] p-3">
+                    <p className="flex items-center gap-2 text-sm font-bold text-[#AD3212]"><AlertTriangle size={16} /> Open in the {provider} window — answer the missing fields in “Application form” below and submit from here.</p>
+                    {formUrl && <a href={formUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 rounded-lg bg-[#AD3212] px-3 py-1.5 text-xs font-bold text-white hover:bg-[#8B280F]"><Eye size={14} /> Open form URL</a>}
+                  </div>
+                )}
+
+                <div className="grid gap-4 xl:grid-cols-2">
+                  <Tile title="Job details" icon={<BriefcaseBusiness size={16} />} mode={tileMode('details')} onMode={setTile('details')}>
+                    <dl className={`grid gap-4 ${tileMode('details') === 'expanded' ? 'sm:grid-cols-4' : 'sm:grid-cols-2'}`}>
+                      <Detail label="Company">{job?.company ?? '—'}</Detail>
+                      <Detail label="Location">{job?.location ?? '—'}</Detail>
+                      <Detail label="Job board">{job?.source ?? '—'}</Detail>
+                      <Detail label="Match">{job?.match_score != null ? `${job.match_score.toFixed(0)}% · ${job.ai_status.toLowerCase()}` : '—'}</Detail>
+                      <Detail label="Resume used">{selectedApp.resume_role ?? '—'}</Detail>
+                      <Detail label="Queue">#{selectedApp.queue_position}</Detail>
+                      <Detail label="Queued">{fmtDate(selectedApp.created_at)}</Detail>
+                      <Detail label="Started">{fmtDate(selectedApp.started_at)}</Detail>
+                      {selectedApp.applied_at && <Detail label="Applied">{fmtDate(selectedApp.applied_at)}</Detail>}
+                      <Detail label="AI usage">{formatTokens(selectedApp.llm_total_tokens)} tokens · {selectedApp.llm_calls ?? 0} calls</Detail>
+                    </dl>
+                    <div className="mt-4 flex flex-wrap gap-2">
+                      {job?.external_url && <a href={job.external_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 rounded-full bg-[#FFE4C8] px-3 py-1.5 text-xs font-bold text-[#82512D] hover:bg-[#FFD7AE]">Job posting <ExternalLink size={12} /></a>}
+                      {formUrl && <a href={formUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 rounded-full bg-[#FFE4C8] px-3 py-1.5 text-xs font-bold text-[#82512D] hover:bg-[#FFD7AE]">Application form <ExternalLink size={12} /></a>}
+                    </div>
+                    {selectedApp.error && <p className="mt-3 rounded-xl bg-[#FFE1D6] px-3 py-2 text-xs font-bold text-[#AD3212]">{selectedApp.error}</p>}
+                  </Tile>
+
+                  <Tile title="Agent log" icon={<Brain size={16} />} mode={tileMode('log')} onMode={setTile('log')}>
+                    <AgentLogPanel events={events} live={isRunning} application={selectedApp} height={tileMode('log') === 'expanded' ? 640 : 300} />
+                  </Tile>
+
+                  <Tile title="Live application flow" icon={<WorkflowIcon size={16} />} mode={tileMode('flow')} onMode={setTile('flow')}>
+                    <div style={{ height: tileMode('flow') === 'expanded' ? 720 : 340 }} className="-m-4 overflow-hidden bg-[radial-gradient(circle_at_1px_1px,rgba(245,106,34,0.10)_1px,transparent_0)] bg-[length:24px_24px]">
+                      <ReactFlow
+                        key={`${selectedApp.id}-${nodes.length}-${tileMode('flow')}`}
+                        nodes={nodes} edges={flowEdges} fitView
+                        fitViewOptions={{ padding: 0.15, minZoom: 0.3, maxZoom: 1.15 }}
+                        nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} panOnDrag
+                        defaultEdgeOptions={{ type: 'smoothstep' }} proOptions={{ hideAttribution: true }}
+                      >
+                        <Background color="#E6B98B" gap={18} size={1} />
+                        <Controls showInteractive={false} />
+                      </ReactFlow>
+                    </div>
+                  </Tile>
+
+                  <Tile title="Live browser" icon={<MonitorPlay size={16} />} mode={tileMode('browser')} onMode={setTile('browser')}>
+                    {watchId ? (
+                      <LiveBrowserPanel embedded token={token} applicationId={selectedApp.id} frame={browserFrame} provider={provider} />
+                    ) : (
+                      <p className="grid min-h-[200px] place-items-center rounded-2xl bg-[#2B160B] p-6 text-center text-sm font-bold text-[#F4D9BE]">The live view shows while a job is running or waiting for you.</p>
+                    )}
+                  </Tile>
+                </div>
+
+                {['HUMAN_REVIEW_REQUIRED', 'SUBMITTED', 'COMPLETED', 'REJECTED', 'FAILED'].includes(selectedApp.status) && (
+                  <ApplicationFormPanel token={token} application={selectedApp} onUpdated={upsertApplication} />
+                )}
+                {isReview && (selectedApp.form_data as { session_open?: boolean } | undefined)?.session_open !== false && (
+                  <InstructAgent token={token} application={selectedApp} onUpdated={upsertApplication} />
+                )}
+              </>
+            )}
+          </section>
+        </div>
       </main>
     </>
   );

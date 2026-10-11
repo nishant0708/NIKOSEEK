@@ -24,7 +24,14 @@ from app.services.form_filler import FIELD_LOCATOR, diagnose_page, find_root_in_
 from app.services.linkedin_browser import has_session_cookie, is_auth_url, page_looks_logged_out
 from app.services.llm import generate_json_object
 from app.services.prompts import render
-from app.services.workday_portal_navigator import detect_ats, ensure_signed_in, ats_prepare, is_stepped_portal
+from app.services.workday_portal_navigator import (
+    _auth_kind as _auth_kind_safe,
+    ats_prepare,
+    detect_ats,
+    ensure_signed_in,
+    in_application_wizard,
+    is_stepped_portal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +132,7 @@ def _on_job_board(page) -> bool:
 
 def _clickable_candidates(elements: list[dict], on_board: bool = True) -> list[dict]:
     """Hard safety rails, independent of the LLM. Sign-in / sign-up controls are blocked on LinkedIn / Indeed only:
-    on a company portal (Workday, iCIMS ...) signing in is part of applying (handled by ats.py)."""
+    on a company portal (Workday, iCIMS ...) signing in is part of applying (handled by workday_portal_navigator.py)."""
     return [
         e for e in elements
         if not EASY_APPLY_PATTERN.search(e["text"])
@@ -320,6 +327,7 @@ async def _navigate(context, page, job: ScrapedJob, user: User | None, log: Log,
     history: list[dict] = []
     reopened = 0
     pending_click: dict | None = None  # an option you picked in a question
+    llm_failures = 0
 
     for step in range(1, MAX_NAV_STEPS + 1):
         _track(log, page)
@@ -368,6 +376,12 @@ async def _navigate(context, page, job: ScrapedJob, user: User | None, log: Log,
                 logger.warning("Portal start/sign-in step failed: %s", exc)
                 await log("warning", f"Portal sign-in step failed: {str(exc).splitlines()[0][:150]}", data={"url": page.url})
 
+        # 2c) Workday application wizard reached: fill it page by page from here (resume step included).
+        if not _on_job_board(page) and await in_application_wizard(page):
+            vendor, tenant = detect_ats(page.url)
+            await log("info", f"{tenant} ({vendor}) application started — filling it page by page.", data={"url": page.url}, stage_key="find")
+            return page, page.main_frame, "ats"
+
         # 3) Indeed's own apply flow (smartapply.indeed.com): a multi-step form like Easy Apply.
         if _on_indeed_apply(page):
             await log("info", "Indeed Apply form reached — filling it step by step.", data={"url": page.url}, stage_key="find")
@@ -405,6 +419,14 @@ async def _navigate(context, page, job: ScrapedJob, user: User | None, log: Log,
 
         # 5) Cheap heuristic: a real form is already here — but only if it is THIS job's form.
         found = await _form_on(page)
+        if not found and not _on_job_board(page) and is_stepped_portal(page.url):
+            # Workday & co. draw the next page with JavaScript (after "Continue" it can take several seconds,
+            # longer when it pre-fills from your resume): wait for the form instead of asking the AI too early.
+            for _ in range(15):
+                await page.wait_for_timeout(1000)
+                found = await _form_on(page)
+                if found or await _auth_kind_safe(page):
+                    break
         if found:
             if await verify_page(user, job, page, log):
                 await log("info", f"Application form detected ({found[1]} fields) at {page.url}", data={"url": page.url, "fields": found[1]}, stage_key="find")
@@ -428,7 +450,16 @@ async def _navigate(context, page, job: ScrapedJob, user: User | None, log: Log,
             if chosen is not None:
                 decision["idx"] = chosen["idx"]
         else:
-            decision = await generate_json_object(_navigation_prompt(user, job, snap, elements, history))
+            try:
+                decision = await generate_json_object(_navigation_prompt(user, job, snap, elements, history))
+            except Exception as exc:
+                # One malformed / failed AI reply must not kill the run: note it and look at the page again.
+                llm_failures += 1
+                await log("warning", f"The AI's reply could not be used ({str(exc).splitlines()[0][:120]}) — retrying.", data={"url": page.url})
+                if llm_failures >= 3:
+                    raise
+                await page.wait_for_timeout(1500)
+                continue
             logger.info("Navigator step %s: %s", step, decision)
             chosen = next((e for e in elements if e["idx"] == decision.get("idx")), None)
             await log(

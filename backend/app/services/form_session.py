@@ -284,6 +284,14 @@ class FormSession:
             if name:
                 self.resume_uploaded = name
                 await log("action", f"Resume attached ({name}).")
+                if self.mode == "ats":
+                    # Portals upload + parse the file before Continue works (Workday "Autofill with Resume").
+                    done = frame.locator('[data-automation-id="file-upload-successful"]:visible, [data-automation-id="delete-file"]:visible')
+                    for _ in range(25):
+                        if await done.count() > 0:
+                            break
+                        await frame.wait_for_timeout(1000)
+                    await frame.wait_for_timeout(1500)
         except Exception as exc:
             await log("warning", f"Could not attach the resume: {str(exc).splitlines()[0][:150]}")
         snap = await self.refresh()
@@ -348,6 +356,15 @@ class FormSession:
         await self.page.wait_for_timeout(1500)
         if await clear_human_checks(self.page, log, f"after “{label}”"):
             await self.page.wait_for_timeout(1500)
+        if self.mode == "ats":
+            # Portals draw the next page with JavaScript (several seconds after "Continue", longer while they
+            # parse your resume). Wait for its Next / Submit button before reading it, or we'd read a blank page.
+            for _ in range(20):
+                frame = await self._target_frame()
+                if await self._next_button(frame) is not None or await self._submit_button(frame) is not None:
+                    break
+                await self.page.wait_for_timeout(1000)
+            await self.page.wait_for_timeout(800)
         frame = await self._target_frame()
         after = await self._signature(frame)
         if after == before:

@@ -791,6 +791,10 @@ async def upload_resume(frame, resume_key: str | None, username: str, root: str 
     file_input = scope.locator('input[type="file"]').first
     if await file_input.count() == 0:
         return None
+    # Workday shows the file it already has (autofill with resume / last application): don't add a second copy.
+    attached = scope.locator('[data-automation-id="file-upload-successful"]:visible, [data-automation-id="delete-file"]:visible')
+    if await attached.count() > 0:
+        return None
     try:
         await file_input.wait_for(state="attached", timeout=3000)
     except Exception:
