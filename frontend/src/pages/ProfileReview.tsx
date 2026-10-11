@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from 'react';
 import { ArrowRight, CheckCircle, ExternalLink, Eye, KeyRound, LoaderCircle, LogOut, PencilLine } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
-import { api, type IndeedSession, type LinkedInSession } from '../lib/api';
+import { api, type IndeedSession, type LinkedInSession, type PortalCredentials } from '../lib/api';
 
 function InlineMarkdown({ value }: { value: string }) {
   return <>{value.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).map((part, index) => {
@@ -55,6 +55,30 @@ function IndeedLogin({ token }: { token: string }) {
     <div className="mt-4 max-w-md"><label className="block text-sm font-bold">Indeed email<Input className="mt-2 bg-white" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@email.com" autoComplete="username" /></label></div>
     <div className="mt-4 flex flex-wrap gap-2"><Button type="button" onClick={save} disabled={busy || !email}>{busy ? <LoaderCircle className="animate-spin" size={16} /> : null}Save Indeed email</Button></div>
     {session?.error && status === 'NEEDS_LOGIN' && <p className="mt-2 text-xs font-bold text-[#AD3212]">{session.error}</p>}{message && <p className="mt-3 text-sm font-bold text-[#805940]">{message}</p>}
+  </div>;
+}
+
+function PortalLogin({ token }: { token: string }) {
+  const [data, setData] = useState<PortalCredentials | null>(null);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [show, setShow] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState('');
+  useEffect(() => { api.portalCredentials(token).then(next => { setData(next); setEmail(next.email); }).catch(() => undefined); }, [token]);
+  async function save() { setBusy(true); setMessage(''); try { const next = await api.savePortalCredentials(token, { email: email.trim(), password: password || null }); setData(next); setPassword(''); setMessage('Job-portal login saved.'); } catch (e) { setMessage(e instanceof Error ? e.message : 'Could not save the job-portal login.'); } finally { setBusy(false); } }
+  async function forget(vendor: string, tenant: string) { setBusy(true); try { setData(await api.forgetPortalAccount(token, vendor, tenant)); } catch (e) { setMessage(e instanceof Error ? e.message : 'Could not update.'); } finally { setBusy(false); } }
+  const accounts = Object.entries(data?.accounts ?? {}).flatMap(([vendor, tenants]) => Object.entries(tenants).filter(([, on]) => on).map(([tenant]) => ({ vendor, tenant })));
+  return <div className="mt-5 rounded-[1.75rem] border border-[#E8C9A4] bg-[#FFFDF8] p-5"><div className="flex items-center gap-2"><KeyRound className="text-orange" size={18} /><h2 className="text-xl font-black">Company job portals</h2></div>
+    <p className="mt-3 text-sm text-[#805940]">LinkedIn and Indeed often send you to the company's own site (Workday, iCIMS, Taleo …), and each company wants its own account. The agent creates that account with this email + password the first time, remembers the company, and signs in directly next time. CAPTCHAs and email verification are left to you in the live window — the agent continues by itself once they're done.</p>
+    <div className="mt-4 grid max-w-2xl gap-3 sm:grid-cols-2">
+      <label className="block text-sm font-bold">Email for job portals<Input className="mt-2 bg-white" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@email.com" autoComplete="username" /></label>
+      <label className="block text-sm font-bold">Password{data?.password_set ? <span className="font-normal text-[#805940]"> (saved — type to change)</span> : null}<div className="mt-2 flex gap-2"><Input className="bg-white" type={show ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} placeholder={data?.password_set ? '••••••••' : '8+ chars, Aa, 1, #'} autoComplete="new-password" /><Button type="button" variant="ghost" size="sm" onClick={() => setShow(v => !v)} aria-label="Show password"><Eye size={14} /></Button></div></label>
+    </div>
+    <p className="mt-2 text-xs text-[#805940]">Most portals require 8+ characters with upper and lower case, a digit and a symbol. Stored encrypted.</p>
+    <div className="mt-4 flex flex-wrap gap-2"><Button type="button" onClick={save} disabled={busy || !email.trim() || (!password && !data?.password_set)}>{busy ? <LoaderCircle className="animate-spin" size={16} /> : null}Save job-portal login</Button></div>
+    {accounts.length > 0 && <div className="mt-4"><p className="text-sm font-bold">Accounts already created</p><div className="mt-2 flex flex-wrap gap-2">{accounts.map(a => <span key={`${a.vendor}:${a.tenant}`} className="inline-flex items-center gap-2 rounded-full bg-[#E3F7D9] px-3 py-1 text-xs font-bold text-[#347233]"><CheckCircle size={12} />{a.tenant} <span className="font-normal">({a.vendor})</span><button type="button" className="text-[#805940] hover:text-[#AD3212]" title="Forget — sign up again next time" onClick={() => forget(a.vendor, a.tenant)} disabled={busy}>×</button></span>)}</div></div>}
+    {message && <p className="mt-3 text-sm font-bold text-[#805940]">{message}</p>}
   </div>;
 }
 
@@ -236,6 +260,7 @@ export function ProfileReview({ token, onDone, onLinkedinChange }: { token: stri
           </div>
         </div>
         <IndeedLogin token={token} />
+        <PortalLogin token={token} />
         {notice && <p className="mt-4 rounded-xl bg-[#E3F7D9] p-3 font-bold text-[#347233]">{notice}</p>}
         {error && <p className="mt-4 rounded-xl bg-[#FFE1D6] p-3 font-bold text-[#AD3212]">{error}</p>}
         <Button size="lg" className="mt-6 w-full" onClick={save} disabled={busy}>{busy ? <LoaderCircle className="animate-spin" /> : <>Save profile & find jobs <ArrowRight size={18} /></>}</Button>

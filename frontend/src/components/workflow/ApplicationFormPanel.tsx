@@ -24,7 +24,7 @@ function FieldControl({ field, value, onChange, disabled }: { field: FormField; 
       </div>
     );
   }
-  if ((field.kind === 'select' || field.kind === 'combobox') && options.length) {
+  if ((field.kind === 'select' || field.kind === 'combobox' || field.kind === 'listbox') && options.length) {
     return (
       <select className={base} value={value} disabled={disabled} onChange={event => onChange(event.target.value)}>
         <option value="">Select an option…</option>
@@ -70,6 +70,10 @@ export function ApplicationFormPanel({ token, application, onUpdated }: { token:
   const answers = form.answers ?? [];
   const [showAnswers, setShowAnswers] = useState(finished);
   const locked = !sessionOpen || busy !== null;
+  // Long forms: collapsible. Open by default only while it needs your answers.
+  const [open, setOpen] = useState(sessionOpen && missingRequired.length > 0);
+  useEffect(() => { if (sessionOpen && missingRequired.length > 0) setOpen(true); // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signature]);
 
   async function run(kind: 'fill' | 'continue' | 'submit' | 'recheck', action: () => Promise<Application>) {
     setBusy(kind); setError('');
@@ -83,14 +87,24 @@ export function ApplicationFormPanel({ token, application, onUpdated }: { token:
   return (
     <div className="rounded-[2rem] border border-[#EBCDAA] bg-[#FFF9F0] p-5">
       <div className="flex flex-wrap items-center gap-2">
-        <h3 className="flex items-center gap-2 text-lg font-black text-ink"><FileText size={18} className="text-orange" /> Application form</h3>
+        <button type="button" onClick={() => setOpen(v => !v)} className="flex items-center gap-2 text-left" aria-expanded={open}>
+          {open ? <ChevronDown size={16} className="text-[#A16A45]" /> : <ChevronRight size={16} className="text-[#A16A45]" />}
+          <h3 className="flex items-center gap-2 text-lg font-black text-ink"><FileText size={18} className="text-orange" /> Application form</h3>
+        </button>
         <span className="rounded-full bg-[#FFE4C8] px-3 py-1 text-[11px] font-black uppercase tracking-[.12em] text-[#82512D]">
-          {form.mode === 'easy_apply' ? `LinkedIn Easy Apply · step ${form.step ?? 1}` : form.mode === 'indeed_apply' ? `Indeed Apply · step ${form.step ?? 1}` : 'Company form'}
+          {form.mode === 'easy_apply' ? `LinkedIn Easy Apply · step ${form.step ?? 1}` : form.mode === 'indeed_apply' ? `Indeed Apply · step ${form.step ?? 1}` : form.mode === 'ats' ? `Company portal · page ${form.step ?? 1}` : 'Company form'}
         </span>
         {form.resume_uploaded && <span className="rounded-full bg-[#E3F7D9] px-3 py-1 text-[11px] font-bold text-[#347233]">Resume attached</span>}
         {finished && <span className="rounded-full bg-[#DDF4D5] px-3 py-1 text-[11px] font-black uppercase tracking-[.12em] text-[#347233]">{application.status.toLowerCase()}</span>}
       </div>
       {form.url && <p className="mt-1 truncate font-mono text-[11px] text-[#805940]">{form.url}</p>}
+
+      {!open && (
+        <button type="button" onClick={() => setOpen(true)} className="mt-3 w-full rounded-xl bg-white px-4 py-2.5 text-left text-sm font-bold text-[#805940] hover:bg-[#FFF4E7]">
+          {fields.length} fields · {missingRequired.length ? `${missingRequired.length} required still need your answer` : 'nothing required missing'}{answers.length ? ` · ${answers.length} answers so far` : ''} — show
+        </button>
+      )}
+      {open && <>
 
       {!sessionOpen && application.status === 'HUMAN_REVIEW_REQUIRED' && (
         <p className="mt-4 flex items-center gap-2 rounded-xl bg-[#FFE1D6] px-4 py-3 text-sm font-bold text-[#AD3212]"><AlertTriangle size={16} /> The form is no longer open in the browser (tab closed or backend restarted). Use Retry in the queue to run this job again.</p>
@@ -149,11 +163,11 @@ export function ApplicationFormPanel({ token, application, onUpdated }: { token:
           </button>
           {showAnswers && (
             <table className="mt-3 w-full text-left text-xs">
-              <thead><tr className="border-b border-[#EBCDAA] text-[#805940]">{(form.mode === 'easy_apply' || form.mode === 'indeed_apply') && <th className="py-1.5 pr-2">Step</th>}<th className="py-1.5 pr-2">Question</th><th className="py-1.5 pr-2">Answer</th><th className="py-1.5">By</th></tr></thead>
+              <thead><tr className="border-b border-[#EBCDAA] text-[#805940]">{(form.mode === 'easy_apply' || form.mode === 'indeed_apply' || form.mode === 'ats') && <th className="py-1.5 pr-2">Step</th>}<th className="py-1.5 pr-2">Question</th><th className="py-1.5 pr-2">Answer</th><th className="py-1.5">By</th></tr></thead>
               <tbody>
                 {answers.map((answer, index) => (
                   <tr key={`${answer.step}-${answer.label}-${index}`} className="border-b border-[#EBCDAA]/50 align-top">
-                    {(form.mode === 'easy_apply' || form.mode === 'indeed_apply') && <td className="py-1.5 pr-2 text-[#805940]">{answer.step}</td>}
+                    {(form.mode === 'easy_apply' || form.mode === 'indeed_apply' || form.mode === 'ats') && <td className="py-1.5 pr-2 text-[#805940]">{answer.step}</td>}
                     <td className="py-1.5 pr-2 font-bold text-[#542914]">{answer.label}</td>
                     <td className="break-all py-1.5 pr-2 text-[#542914]">{answer.value}</td>
                     <td className="py-1.5 text-[#805940]">{answer.source === 'ai' ? 'AI' : answer.source === 'user' ? 'You' : answer.source === 'prefilled' ? 'Prefilled' : '—'}</td>
@@ -198,6 +212,7 @@ export function ApplicationFormPanel({ token, application, onUpdated }: { token:
           </label>
         </div>
       )}
+      </>}
     </div>
   );
 }

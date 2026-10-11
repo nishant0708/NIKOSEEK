@@ -44,6 +44,12 @@ function buildNodes(model: string): Node[] {
     node('statuses', 900, 680, '🏁 Statuses', 'Submitted · Completed · Rejected · Failed (manual moves from the queue).', 'status'),
     node('assist', 300, 680, '🧠 Browser assistant', 'Turns your typed instructions into clicks / field fills.', 'prompt', 'browser_assistant'),
     node('log', 900, 170, '📜 Agent log + tokens', 'Every AI decision, action and token count is saved per attempt.', 'status'),
+    // Company portals (Workday, iCIMS, Taleo …)
+    node('start', 1200, 340, '🚪 Workday start screen', 'Company you have an account with → Use My Last Application; new company → Autofill with Resume; else Apply Manually.', 'agent'),
+    node('account', 1500, 340, '🔑 Sign up / sign in', 'Your job-portal login (Profile page). First time: creates the account and remembers it (workday: {company: true}); next time signs in.', 'agent'),
+    node('captcha', 1500, 170, '🧩 CAPTCHA / email check', 'You solve it in the live view (or click the email link); the agent notices and continues by itself.', 'human'),
+    node('pages', 1500, 510, '📄 Page by page', 'Uploads the resume, adds a Work Experience / Education entry per job & degree, fills each page, presses Save and Continue — stops at Review.', 'agent'),
+    node('structure', 1200, 680, '🧠 Profile → structured data', 'Turns profile.md + details.md into name parts, address, phone code and dated jobs/degrees for long forms.', 'prompt', 'profile_structuring'),
   ];
 }
 
@@ -59,6 +65,8 @@ const EDGES: Edge[] = [
   edge('check1', 'easy'), edge('easy', 'ea', 'yes'), edge('easy', 'nav', 'no'), edge('nav', 'check2'), edge('check2', 'fill'),
   edge('ea', 'fill', 'each step'), edge('fill', 'answers'), edge('answers', 'submit'), edge('submit', 'statuses'),
   edge('open', 'log', undefined, true), edge('answers', 'assist', 'instruct', true),
+  edge('nav', 'start', 'company portal'), edge('start', 'account'), edge('account', 'captcha', 'if shown', true), edge('account', 'pages'),
+  edge('pages', 'answers', 'missing answers / Review'), edge('structure', 'fill', undefined, true), edge('structure', 'pages', undefined, true),
 ];
 
 function Canvas({ model, height, onPromptClick, fullscreen }: { model: string; height: number | string; onPromptClick?: (key: string) => void; fullscreen?: boolean }) {

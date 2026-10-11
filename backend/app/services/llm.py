@@ -109,10 +109,23 @@ async def generate_json_object(prompt: str, model: str | None = None) -> dict:
     meter = current_meter.get()
     if meter is not None:
         meter.add(response.usage_metadata)
-    text = (response.text or "").strip()
+    return parse_json_object(response.text or "")
+
+
+def parse_json_object(text: str) -> dict:
+    """The first JSON object in a model reply. Tolerates extra text after it (Gemini sometimes appends a second
+    object or a note: "Extra data: line 1 column 145"), code fences, and a one-element array wrapping the object."""
+    text = (text or "").strip()
     if text.startswith("```"):
         text = text.strip("`").removeprefix("json").strip()
-    data = json.loads(text)
-    if not isinstance(data, dict):
-        raise ValueError("Gemini returned a non-object JSON response")
-    return data
+    decoder = json.JSONDecoder()
+    for start in [0] + [i for i, ch in enumerate(text) if ch in "{["][:20]:
+        try:
+            data, _ = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, list):
+            data = next((item for item in data if isinstance(item, dict)), None)
+        if isinstance(data, dict):
+            return data
+    raise ValueError(f"Gemini did not return a JSON object: {text[:200]!r}")

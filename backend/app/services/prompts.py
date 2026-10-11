@@ -26,7 +26,9 @@ PROMPTS: dict[str, dict] = {
 and the browser is already logged in to LinkedIn.
 
 Rules:
-- Easy Apply, Submit and sign-in controls were already removed from the list; never try to work around that.
+- Easy Apply and Submit controls (and LinkedIn / Indeed sign-in controls) were already removed from the list; never try to work around that.
+- Company portals (Workday, iCIMS, ...): their sign-in / create-account pages and Workday's "Apply Manually" screen are handled
+  automatically, so just pick the Apply button on the job page.
 - Prefer an "Apply" / "Apply on company website" button or link (often with an external-link icon).
 - On a company careers page that only shows a job description, click its Apply / Apply Now button.
 - Dismiss cookie banners only if they block the Apply button.
@@ -100,9 +102,44 @@ Match the value to the field TYPE: if "type" is number, "inputmode" is numeric/d
 number (e.g. "Enter a decimal number larger than 0.0"), answer digits only — "10 LPA" becomes "10", "1 year" becomes "1".
 Keep units consistent with the question (if it asks in lakhs, 10 LPA -> 10; if it asks the yearly amount in rupees, -> 1000000).
 If a field has "error", the current value was rejected: return a corrected value that satisfies the error message.
+Use the "Structured profile" JSON for split names, address parts, phone country code / national number, and dates.
+Fields with a "group" like "Work Experience 2" or "Education 1" belong to the Nth entry of the structured experience /
+education list (most recent first): fill Job Title / Company / Location / From (Month, Year) / To / "I currently work here" /
+Role Description from THAT entry. Phone number fields that sit next to a separate country-code field get the national number only.
+"How did you hear about us" style questions: pick the option for the job board the job came from (LinkedIn / Indeed) when it exists.
 CRITICAL: consent / terms / EEO / demographic questions are ALWAYS "ASK_USER".
 For numeric "years of experience" questions answer with a whole number only if the profile makes it explicit.
 Example: {"f0": "John", "f1": "ASK_USER"}""",
+    },
+    "profile_structuring": {
+        "title": "Profile → structured data",
+        "description": "Turns your profile.md + details.md into structured data (name parts, address, phone code, every job and degree with dates). "
+                       "Long company forms (Workday, Greenhouse, iCIMS ...) are filled from it. Rebuilt automatically whenever your profile changes.",
+        "variables": ["profile", "today"],
+        "output": '{"first_name": "...", "experience": [...], "education": [...]}',
+        "template": """Convert this job applicant's profile into structured JSON for filling job application forms. Today is {{today}}.
+---
+{{profile}}
+---
+Return ONLY one raw JSON object with exactly these keys:
+{"first_name":"","middle_name":"","last_name":"","full_name":"","email":"","phone_country_code":"","phone_national":"",
+ "country":"","state":"","city":"","postal_code":"","address_line1":"",
+ "linkedin_url":"","github_url":"","portfolio_url":"",
+ "current_title":"","current_company":"","total_experience_years":0,"highest_education":"",
+ "experience":[{"company":"","title":"","location":"","start_month":"","start_year":"","end_month":"","end_year":"","current":false,"description":""}],
+ "education":[{"school":"","degree":"","field_of_study":"","start_year":"","end_year":"","grade":"","location":"","current":false}],
+ "skills":[],"languages":[],"notice_period_days":null,"current_ctc":"","expected_ctc":"","work_authorization":"","willing_to_relocate":""}
+Rules:
+- Copy facts exactly (names, email, phone digits, URLs, company and school names). Never invent anything: unknown -> "" (or null / []).
+- Name: the heading name split into first / middle / last.
+- Phone: phone_national = the digits without country code; phone_country_code like "+91" only if stated or the number is clearly
+  from that country (a 10-digit Indian mobile starting 6-9 -> "+91").
+- Location: city = the FIRST city of the Location line; country from it; state = that city's state/province (a well-known fact), else "".
+- URLs: add "https://" when the profile omits it.
+- experience / education: every entry, most recent first. Months as two digits ("06"), years as four digits; "Present" -> current=true and
+  empty end dates. description = 2-4 short sentences from that role's bullets.
+- total_experience_years: full-time + internship months added up until today, as a number with one decimal.
+- notice_period_days / current_ctc / expected_ctc / work_authorization / willing_to_relocate: ONLY if explicitly stated, else empty.""",
     },
     "browser_assistant": {
         "title": "Browser assistant (your instructions)",
@@ -129,8 +166,11 @@ Form fields on the current step (key = id to fill; use one of "options" when pre
 
 Rules:
 - Do only what the instruction asks, with the fewest actions. Numbers-only fields get digits only (10 LPA -> 10).
-- If the instruction concerns a question on an EARLIER step (see previous answers), return {"type":"back"} and set done=false;
-  you will be called again on that step. After fixing it, return {"type":"next"} to move forward again (done=true when back where you started).
+- If the instruction concerns a question on an EARLIER step (see previous answers) — e.g. the applicant spotted a wrong answer on the
+  review page — go there: click that section's "Edit" button if the review page has one, otherwise return {"type":"back"} (one step per
+  call). Set done=false while you are still on the way; you are called again on the new step after every click / back.
+- Once the right field is fixed, return done=true and STOP: do NOT press next — the app itself moves forward through the remaining
+  steps (re-checking them) back to the review page.
 - Never click a Submit / Send application button — the applicant submits with the Submit button in the app.
 - If nothing more is needed (or it cannot be done), return no actions, done=true, and explain in "reply".
 Return ONLY raw JSON: {"reply":"one short sentence","done":true,"actions":[{"type":"fill","key":"f2","value":"India (+91)"}]}""",

@@ -2,7 +2,15 @@ from fastapi import APIRouter, File, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field
 
 from app.api.deps import CurrentUser, DbSession
-from app.services.agent_config import indeed_public_payload, linkedin_public_payload, set_indeed_credentials, set_linkedin_credentials
+from app.services.agent_config import (
+    ats_public_payload,
+    indeed_public_payload,
+    linkedin_public_payload,
+    mark_ats_account,
+    set_ats_credentials,
+    set_indeed_credentials,
+    set_linkedin_credentials,
+)
 from app.services.storage import PROFILE_TEMPLATE, read_profile_markdown, save_profile_markdown
 from app.services.storage import read_details_markdown
 from app.services.profile_generation import generate_profile_documents
@@ -36,6 +44,17 @@ class IndeedCredentialsRead(BaseModel):
 
 
 class IndeedCredentialsUpdate(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str | None = Field(default=None, max_length=200)
+
+
+class AtsCredentialsRead(BaseModel):
+    email: str = ""
+    password_set: bool = False
+    accounts: dict[str, dict[str, bool]] = {}
+
+
+class AtsCredentialsUpdate(BaseModel):
     email: str = Field(min_length=3, max_length=320)
     password: str | None = Field(default=None, max_length=200)
 
@@ -103,6 +122,34 @@ def update_indeed_credentials(payload: IndeedCredentialsUpdate, user: CurrentUse
     db.commit()
     db.refresh(user)
     return IndeedCredentialsRead.model_validate(indeed_public_payload(user))
+
+
+@router.get("/ats")
+def get_ats_credentials(user: CurrentUser) -> AtsCredentialsRead:
+    """The ONE email + password the agent uses to sign up / sign in on company job portals (Workday, iCIMS, ...)."""
+    return AtsCredentialsRead.model_validate(ats_public_payload(user))
+
+
+@router.put("/ats")
+def update_ats_credentials(payload: AtsCredentialsUpdate, user: CurrentUser, db: DbSession) -> AtsCredentialsRead:
+    current = ats_public_payload(user)
+    password = payload.password.strip() if payload.password and payload.password.strip() else None
+    if password and len(password) < 8:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Use at least 8 characters — most portals also want upper + lower case, a digit and a symbol")
+    if not password and not current["password_set"]:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Enter a password for your job-portal accounts")
+    set_ats_credentials(user, payload.email, password)
+    db.commit()
+    db.refresh(user)
+    return AtsCredentialsRead.model_validate(ats_public_payload(user))
+
+
+@router.delete("/ats/accounts/{vendor}/{tenant}")
+def forget_ats_account(vendor: str, tenant: str, user: CurrentUser, db: DbSession) -> AtsCredentialsRead:
+    """Forget that a company already has an account (the agent will try to sign up there again)."""
+    mark_ats_account(user, vendor, tenant, signed_up=False)
+    db.refresh(user)
+    return AtsCredentialsRead.model_validate(ats_public_payload(user))
 
 
 @router.post("/upload")

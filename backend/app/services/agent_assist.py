@@ -14,7 +14,7 @@ import re
 import uuid
 
 from app.db.models import User
-from app.services.form_filler import set_field_value
+from app.services.form_filler import _click, set_field_value
 from app.services.llm import generate_json_object
 from app.services.prompts import render
 
@@ -116,9 +116,11 @@ async def run_instruction(session, frame, scope, instruction: str, user: User | 
             try:
                 if kind == "click" and action.get("idx") in by_idx:
                     element = by_idx[action["idx"]]
-                    await frame.locator(f'[data-agent-idx="{action["idx"]}"]').first.click(timeout=5000)
-                    await frame.wait_for_timeout(1200)
+                    await _click(frame.locator(f'[data-agent-idx="{action["idx"]}"]').first)
+                    await frame.wait_for_timeout(1500)
                     done.append(f"clicked “{element['text'][:60]}”")
+                    moved = True
+                    break  # a click (Edit / Add / a tab) may change the page: re-read it before the next action
                 elif kind == "fill" and action.get("key") in by_key and action.get("value") is not None:
                     field = by_key[action["key"]]
                     await set_field_value(frame, field, str(action["value"]))
@@ -129,7 +131,7 @@ async def run_instruction(session, frame, scope, instruction: str, user: User | 
                     if button is None:
                         failed.append(f"no {kind.title()} button on this step")
                         continue
-                    await button.click(timeout=5000)
+                    await _click(button)
                     await session.page.wait_for_timeout(1500)
                     session.step += -1 if kind == "back" else 1
                     session.ai_keys.clear(); session.user_keys.clear(); session.blocked_keys.clear()
@@ -141,10 +143,71 @@ async def run_instruction(session, frame, scope, instruction: str, user: User | 
                     failed.append(f"skipped {json.dumps(action)[:80]}")
             except Exception as exc:
                 failed.append(f"{json.dumps(action)[:60]}: {str(exc).splitlines()[0][:100]}")
-        if plan.get("done", True) and not moved:
+        if not moved and (plan.get("done", True) or not actions):
             break
     if done:
         await log("action", "Did: " + "; ".join(done))
     if failed:
         await log("warning", "Could not: " + "; ".join(failed))
     return {"reply": reply, "done": done, "failed": failed, "filled_keys": filled_keys}
+
+
+HUMAN_WAIT_TIMEOUT_S = 600
+
+
+async def wait_for_human(log, question: str, resolved, *, options: list[dict] | None = None, reason: str = "",
+                         timeout_s: int = HUMAN_WAIT_TIMEOUT_S) -> dict | None:
+    """Ask the applicant to do something in the browser window (solve a CAPTCHA, verify an email, ...) and wait.
+    Returns as soon as `resolved()` turns true ({"done": True}) or the applicant answers (their answer dict);
+    None on timeout. Works from the navigator and from an open FormSession alike."""
+    import asyncio
+
+    application_id = log.application.id
+    options = options if options is not None else [{"id": 0, "label": "Done — continue"}]
+    entry = questions.open(application_id, question, options, reason)
+    await log("question", question, data={"question_id": entry["id"], "options": options, "reason": reason, "timeout_s": timeout_s})
+    stage_cb = getattr(log, "on_question", None)
+    if callable(stage_cb):
+        await stage_cb(entry)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    try:
+        while loop.time() < deadline:
+            answer = questions.take_answer(application_id, entry["id"])
+            if answer is not None:
+                return answer
+            try:
+                if await resolved():
+                    await log("info", "Done in the browser — continuing by myself.")
+                    return {"done": True}
+            except Exception:
+                pass
+            await asyncio.sleep(1.5)
+        return None
+    finally:
+        questions.close(application_id)
+        resume_cb = getattr(log, "on_question_closed", None)
+        if callable(resume_cb):
+            await resume_cb()
+
+
+async def clear_human_checks(page, log, where: str = "") -> bool:
+    """If a CAPTCHA / verification page is waiting, ask the applicant to solve it in the live window and resume
+    automatically the moment it's gone. Returns True if it had to wait."""
+    from app.services.browser_common import human_check_pending
+
+    kind = await human_check_pending(page)
+    if not kind:
+        return False
+    await log("warning", f"{kind} detected{(' ' + where) if where else ''} — waiting for you to solve it in the browser window.", data={"url": page.url})
+
+    async def gone() -> bool:
+        return not await human_check_pending(page)
+
+    answer = await wait_for_human(
+        log, f"Please solve the {kind} in the browser window (or the live view). I'll continue automatically as soon as it's solved.",
+        gone, reason=kind)
+    if answer is None:
+        raise RuntimeError(f"The {kind} was not solved in time.")
+    await page.wait_for_timeout(1500)
+    return True

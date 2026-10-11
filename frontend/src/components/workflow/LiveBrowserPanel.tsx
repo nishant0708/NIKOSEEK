@@ -8,7 +8,7 @@ const SPECIAL_KEYS = new Set(['Enter', 'Tab', 'Backspace', 'Delete', 'Escape', '
  * Live view of the exact browser tab the agent is driving (LinkedIn / Indeed block real iframes,
  * so the backend streams screenshots and forwards your clicks, typing and scrolling).
  */
-export function LiveBrowserPanel({ token, applicationId, frame, provider }: { token: string; applicationId: number; frame: BrowserFrame | null; provider: string }) {
+export function LiveBrowserPanel({ token, applicationId, frame, provider, embedded = false }: { token: string; applicationId: number; frame: BrowserFrame | null; provider: string; embedded?: boolean }) {
   const [interactive, setInteractive] = useState(true);
   const [expanded, setExpanded] = useState(false);
   const [error, setError] = useState('');
@@ -45,9 +45,10 @@ export function LiveBrowserPanel({ token, applicationId, frame, provider }: { to
 
   const image = frame?.application_id === applicationId ? frame.image : null;
   return (
-    <div className={`rounded-[2rem] border border-[#EBCDAA] bg-[#FFF9F0] p-4 ${expanded ? 'fixed inset-3 z-50 flex flex-col shadow-2xl' : ''}`}>
+    // embedded: sits inside a Live workflow box that already has the title and its own frame.
+    <div className={expanded ? 'fixed inset-3 z-50 flex flex-col rounded-[2rem] border border-[#EBCDAA] bg-[#FFF9F0] p-4 shadow-2xl' : embedded ? '' : 'rounded-[2rem] border border-[#EBCDAA] bg-[#FFF9F0] p-4'}>
       <div className="flex flex-wrap items-center gap-2 px-1">
-        <h3 className="flex items-center gap-2 text-lg font-black text-ink"><MonitorPlay size={18} className="text-orange" /> Live browser</h3>
+        {(!embedded || expanded) && <h3 className="flex items-center gap-2 text-lg font-black text-ink"><MonitorPlay size={18} className="text-orange" /> Live browser</h3>}
         <span className="rounded-full bg-[#FFE4C8] px-2.5 py-0.5 text-[11px] font-black text-[#82512D]">{provider} window</span>
         <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-[#805940]">{frame?.application_id === applicationId ? frame.url : ''}</span>
         <button type="button" title="Back" onClick={() => send({ kind: 'back' })} className="rounded-full p-1.5 text-[#82512D] hover:bg-[#FFE4C8]"><ArrowLeft size={15} /></button>
