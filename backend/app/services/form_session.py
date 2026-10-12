@@ -16,8 +16,9 @@ import re
 from dataclasses import dataclass, field as dc_field
 
 from app.db.models import User
-from app.services.form_filler import _click, collect_fields, fill_fields, find_root_in_page, resolve_root, resolve_values, upload_resume
+from app.services.form_filler import _click, collect_fields, fill_fields, find_root_in_page, resolve_root, resolve_values
 from app.services.job_navigator import find_form_frame
+from app.services.resume_upload import attach_resume
 
 logger = logging.getLogger(__name__)
 
@@ -280,11 +281,13 @@ class FormSession:
         self.ai_keys |= set(filled)
         self.last_errors = errors
         try:
-            name = await upload_resume(frame, self.resume_key, user.username, self.root)
+            name, how = await attach_resume(frame, self.fields, mode=self.mode, resume_key=self.resume_key, user_id=user.id,
+                                            username=user.username, root=self.root)
             if name:
                 self.resume_uploaded = name
-                await log("action", f"Resume attached ({name}).")
-                if self.mode == "ats":
+                await log("action", f"Resume {'selected — already in your account' if how == 'selected' else 'attached'} ({name}).",
+                          data={"resume_key": self.resume_key, "how": how})
+                if how == "uploaded" and self.mode == "ats":
                     # Portals upload + parse the file before Continue works (Workday "Autofill with Resume").
                     done = frame.locator('[data-automation-id="file-upload-successful"]:visible, [data-automation-id="delete-file"]:visible')
                     for _ in range(25):
@@ -303,6 +306,19 @@ class FormSession:
                       "fill_errors": {f.get("label"): error for key, error in errors.items() for f in self.fields if f["key"] == key},
                   })
         return snap
+
+    async def switch_resume(self, resume_key: str, user: User, log) -> tuple[dict, bool]:
+        """Use another resume on the open form. Re-attaches it when the current step has a resume field.
+        Returns (snapshot, attached_now)."""
+        self.resume_key = resume_key
+        frame = await self._target_frame()
+        self.fields = await collect_fields(frame, self.root)
+        name, how = await attach_resume(frame, self.fields, mode=self.mode, resume_key=resume_key, user_id=user.id,
+                                        username=user.username, root=self.root, replace=True)
+        if name:
+            self.resume_uploaded = name
+            await log("action", f"Switched resume: {'selected' if how == 'selected' else 'attached'} {name}.", data={"resume_key": resume_key, "how": how})
+        return await self.refresh(), bool(name)
 
     async def autofill(self, user: User, job, log, snap: dict | None = None) -> dict:
         """Fill the current step; for Easy Apply keep pressing Next/Review while nothing required is missing."""

@@ -468,7 +468,7 @@ async def _click(locator, timeout: int = 5000) -> None:
 async def resolve_values(fields: list[dict], user: User, job, notes: list[str] | None = None, *, recheck_all: bool = False,
                          protect: set[str] | None = None) -> tuple[dict[str, str], str]:
     """`protect`: keys the applicant set themselves on this step — never overwritten (not even by the fixed rules below)."""
-    protect = protect or set()
+    protect = (protect or set()) | {f["key"] for f in fields if is_resume_choice(f)}
     fields = [f for f in fields if f["key"] not in protect]
     resolved, mode = await _resolve_values(fields, user, job, notes, recheck_all=recheck_all)
     answers = await asyncio.to_thread(profile_answers, user.username)
@@ -781,8 +781,22 @@ async def fill_fields(frame, fields: list[dict], values: dict[str, str]) -> tupl
     return filled, errors
 
 
-async def upload_resume(frame, resume_key: str | None, username: str, root: str | None = None) -> str | None:
-    """Attach the chosen resume to the first file input (like apply.js). Returns the file name or None."""
+RESUME_FILE_OPTION = re.compile(r"\.(pdf|docx?)\b", re.I)
+
+
+def is_resume_choice(field: dict) -> bool:
+    """LinkedIn / Indeed list resumes you already uploaded as choices ("Nishant_Backend.pdf"). The resume agent picks
+    those itself, so the form-filling AI must never touch them."""
+    options = field.get("options") or []
+    return field.get("kind") in ("radio", "checkbox", "select", "listbox", "combobox") and any(RESUME_FILE_OPTION.search(str(o)) for o in options)
+
+
+async def upload_resume(frame, resume_key: str | None, username: str, root: str | None = None, *,
+                        user_id: int | None = None, file_name: str | None = None, replace: bool = False) -> str | None:
+    """Attach the chosen resume to the first file input (like apply.js). Returns the file name or None.
+
+    The file is named after the resume (e.g. Nishant_Kaushal_Backend_Developer_Python_heavy.pdf) so LinkedIn / Indeed
+    list every variant separately. `replace`: Workday already shows a file -> delete it first (Switch resume)."""
     if not resume_key:
         return None
     scope = (await resolve_root(frame, root)) if root else frame
@@ -794,15 +808,28 @@ async def upload_resume(frame, resume_key: str | None, username: str, root: str 
     # Workday shows the file it already has (autofill with resume / last application): don't add a second copy.
     attached = scope.locator('[data-automation-id="file-upload-successful"]:visible, [data-automation-id="delete-file"]:visible')
     if await attached.count() > 0:
-        return None
+        if not replace:
+            return None
+        delete = scope.locator('[data-automation-id="delete-file"]:visible').first
+        if await delete.count() == 0:
+            return None
+        await _click(delete)
+        await frame.wait_for_timeout(1200)
     try:
         await file_input.wait_for(state="attached", timeout=3000)
     except Exception:
         return None
     data = await asyncio.to_thread(download_file, resume_key)
     suffix = Path(resume_key).suffix or ".pdf"
-    name = f"{re.sub(r'[^A-Za-z0-9_-]+', '_', username)}_resume{suffix}"
-    path = Path(tempfile.gettempdir()) / "job-automation-resumes" / name
+    if not file_name and user_id is not None:
+        from app.services.resume_store import upload_name_for  # local import: avoid a cycle
+
+        file_name = await asyncio.to_thread(upload_name_for, user_id, resume_key)
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", file_name or f"{username}_resume{suffix}")
+    if not name.lower().endswith(suffix.lower()):
+        name += suffix
+    # Per-user folder: two users' resumes with the same display name never overwrite each other.
+    path = Path(tempfile.gettempdir()) / "job-automation-resumes" / re.sub(r"[^A-Za-z0-9_-]+", "_", username) / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     await file_input.set_input_files(str(path))

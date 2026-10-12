@@ -3,9 +3,9 @@ const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000/api/v1';
 export type User = { id: number; username: string; created_at: string; is_admin: boolean };
 export type AgentConfig = { match_scoring: { model: string }; system_prompt: string; can_edit_system_prompt: boolean };
 export type AuthResponse = { access_token: string; token_type: string; user: User };
-export type Job = { id?: number; source: string; external_url: string; title?: string; company?: string; location?: string; description?: string; date_posted?: string; ai_status: string; match_score?: number; ai_reason?: string; experience_match?: string };
+export type Job = { id?: number; source: string; external_url: string; title?: string; company?: string; location?: string; description?: string; date_posted?: string; ai_status: string; match_score?: number; ai_reason?: string; experience_match?: string; resume_category?: string | null };
 export type ApplicationJob = { id: number; source: string; external_url: string; title?: string; company?: string; location?: string; ai_status: string; match_score?: number };
-export type Application = { id: number; job_id: number; resume_key: string; resume_role?: string | null; status: string; stage: string; queue_position: number; application_url?: string | null; form_data?: Record<string, unknown>; error?: string | null; created_at: string; updated_at: string; started_at?: string | null; applied_at?: string | null; completed_at?: string | null; llm_input_tokens?: number; llm_output_tokens?: number; llm_total_tokens?: number; llm_calls?: number; pending_question?: AgentQuestion | null; job: ApplicationJob };
+export type Application = { id: number; job_id: number; resume_key: string; resume_role?: string | null; resume_agent?: ResumeAgentDecision; status: string; stage: string; queue_position: number; application_url?: string | null; form_data?: Record<string, unknown>; error?: string | null; created_at: string; updated_at: string; started_at?: string | null; applied_at?: string | null; completed_at?: string | null; llm_input_tokens?: number; llm_output_tokens?: number; llm_total_tokens?: number; llm_calls?: number; pending_question?: AgentQuestion | null; job: ApplicationJob };
 export type AgentQuestion = { id: string; question: string; reason?: string; options: { id: number; label: string; idx?: number }[] };
 export type BrowserFrame = { application_id: number; image: string | null; url?: string; title?: string; width?: number; height?: number; reason?: string };
 export type BrowserInputEvent = { kind: 'click' | 'type' | 'key' | 'scroll' | 'back' | 'reload' | 'front'; x?: number; y?: number; text?: string; key?: string; dy?: number };
@@ -19,7 +19,7 @@ export const LINKEDIN_NOT_CONNECTED = 'LINKEDIN_NOT_CONNECTED';
 export type IndeedCredentials = { email: string; password_set: boolean };
 export type IndeedSession = { source: string; status: LinkedInSessionStatus; connected: boolean; last_login_at?: string | null; last_checked_at?: string | null; error?: string | null; credentials: IndeedCredentials };
 export const INDEED_NOT_CONNECTED = 'INDEED_NOT_CONNECTED';
-export type AgentStageKey = 'open' | 'login' | 'find' | 'fields' | 'review' | 'failed';
+export type AgentStageKey = 'resume' | 'open' | 'login' | 'find' | 'fields' | 'review' | 'failed';
 export type AgentEventKind = 'stage' | 'thinking' | 'action' | 'info' | 'warning' | 'error' | 'question';
 export type AgentEvent = { id: number | null; application_id: number; attempt: number; stage_key: AgentStageKey; kind: AgentEventKind; message: string; data: Record<string, unknown>; created_at: string | null };
 export type FormFieldKind = 'text' | 'textarea' | 'select' | 'radio' | 'checkbox' | 'combobox' | 'listbox';
@@ -29,6 +29,13 @@ export type FormAnswer = { step: number; label: string; value: string; source?: 
 export type ManualStatus = 'FAILED' | 'COMPLETED' | 'REJECTED';
 export type AgentPrompt = { key: string; title: string; description: string; variables: string[]; output: string; default: string; content: string; customized: boolean };
 export type AgentEventsResponse = { application_id: number; attempt: number; events: AgentEvent[] };
+// Resume agent: your resumes (uploaded + generated), its settings, and the per-application decision.
+export type ResumeInfo = { id: number; storage_key: string; role: string; category: string; file_name: string; label: string; origin: 'uploaded' | 'generated'; upload_name: string; parent_id?: number | null; source_job_id?: number | null; created_at?: string | null; portals: Record<string, string> };
+export type ResumeAgentSettings = { enabled: boolean; reuse_threshold: number; tailor_min: number; max_rounds: number; model: string };
+export type ResumeCandidate = { resume_key: string; label: string; origin: string; score: number; matched: string[]; missing: string[]; reason: string };
+export type ResumeAgentStatus = 'reused' | 'generated' | 'low_fit' | 'tailor_no_gain';
+export type ResumeAgentDecision = { status?: ResumeAgentStatus; category?: string; candidates?: ResumeCandidate[]; jd_keywords?: string[]; base_key?: string; base_score?: number; chosen_key?: string; chosen_label?: string; chosen_score?: number; tailored_score?: number | null; keywords_added?: string[]; pinned?: boolean; thresholds?: { reuse: number; tailor_min: number } };
+export type ResumeSwitchResult = 'attached' | 'not_on_this_step' | 'queued' | 'retry';
 
 async function request<T>(path: string, init: RequestInit = {}, token?: string): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, {
@@ -40,6 +47,15 @@ async function request<T>(path: string, init: RequestInit = {}, token?: string):
     throw new Error(data?.detail ?? 'Something went wrong. Please try again.');
   }
   return response.json() as Promise<T>;
+}
+
+async function requestBlob(path: string, token: string): Promise<Blob> {
+  const response = await fetch(`${API_URL}${path}`, { headers: { Authorization: `Bearer ${token}` } });
+  if (!response.ok) {
+    const data = await response.json().catch(() => null);
+    throw new Error(data?.detail ?? 'Could not load the file.');
+  }
+  return response.blob();
 }
 
 function applicationSocketUrl(token: string) {
@@ -87,6 +103,11 @@ export const api = {
   browserInput: (token: string, applicationId: number, event: BrowserInputEvent) => request<{ url: string }>(`/applications/${applicationId}/browser/input`, { method: 'POST', body: JSON.stringify(event) }, token),
   setApplicationStatus: (token: string, applicationId: number, status: ManualStatus, reason?: string) => request<Application>(`/applications/${applicationId}/status`, { method: 'POST', body: JSON.stringify({ status, reason }) }, token),
   submitApplication: (token: string, applicationId: number) => request<Application>(`/applications/${applicationId}/submit`, { method: 'POST' }, token),
+  resumes: (token: string) => request<ResumeInfo[]>('/resumes', {}, token),
+  resumeFile: (token: string, key: string) => requestBlob(`/resumes/file?key=${encodeURIComponent(key)}`, token),
+  switchResume: (token: string, applicationId: number, resumeKey: string) => request<{ application: Application; result: ResumeSwitchResult }>(`/applications/${applicationId}/resume`, { method: 'POST', body: JSON.stringify({ resume_key: resumeKey }) }, token),
+  resumeAgent: (token: string) => request<ResumeAgentSettings>('/agent-config/resume-agent', {}, token),
+  saveResumeAgent: (token: string, settings: ResumeAgentSettings) => request<ResumeAgentSettings>('/agent-config/resume-agent', { method: 'PUT', body: JSON.stringify(settings) }, token),
   agentPrompts: (token: string) => request<AgentPrompt[]>('/agent-config/prompts', {}, token),
   saveAgentPrompt: (token: string, key: string, content: string) => request<AgentPrompt[]>(`/agent-config/prompts/${key}`, { method: 'PUT', body: JSON.stringify({ content }) }, token),
   resetAgentPrompt: (token: string, key: string) => request<AgentPrompt[]>(`/agent-config/prompts/${key}`, { method: 'DELETE' }, token),

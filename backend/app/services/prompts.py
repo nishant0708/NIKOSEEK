@@ -137,9 +137,98 @@ Rules:
 - Location: city = the FIRST city of the Location line; country from it; state = that city's state/province (a well-known fact), else "".
 - URLs: add "https://" when the profile omits it.
 - experience / education: every entry, most recent first. Months as two digits ("06"), years as four digits; "Present" -> current=true and
-  empty end dates. description = 2-4 short sentences from that role's bullets.
+  empty end dates. description = 4-6  sentences from that role's bullets if possible else 2-4 short sentences.
 - total_experience_years: full-time + internship months added up until today, as a number with one decimal.
 - notice_period_days / current_ctc / expected_ctc / work_authorization / willing_to_relocate: ONLY if explicitly stated, else empty.""",
+    },
+    "job_categorization": {
+        "title": "Resume agent · job → resume category",
+        "description": "Resume agent (scorer 2, fallback): puts a job into one of your resume folders (frontend / backend / full stack ...) "
+                       "when the job-search scorer did not already do it. Only runs while the Resume agent is ON.",
+        "variables": ["job_title", "job_description", "categories"],
+        "output": '{"category": "backend-developer", "reason": "..."}',
+        "template": """Classify this job's PRIMARY role family from the job itself (title + responsibilities + requirements).
+Do NOT consider the applicant or which resumes they have.
+Choices (the applicant's own folders come first): {{categories}}
+
+Job title: {{job_title}}
+Job description:
+---
+{{job_description}}
+---
+Rules:
+- A React / TypeScript / UI role is frontend-developer; a Python / Java / Node API or services role is backend-developer;
+  only a role that clearly owns both UI and APIs is full-stack-developer. "Nice to have" skills do not change the family.
+- If one of the choices means the same family, return exactly that choice. If none fits, return a new short lowercase slug.
+Return ONLY raw JSON: {"category": "<slug>", "reason": "one short sentence"}""",
+    },
+    "resume_scoring": {
+        "title": "Resume agent · JD ↔ resume scorer",
+        "description": "Resume agent (scorer 3): reads the real job description and scores each of your resumes in the job's category "
+                       "0–100 like an ATS + recruiter would, listing the JD keywords each resume is missing. Only runs while the Resume agent is ON.",
+        "variables": ["job_title", "job_company", "job_description", "resumes"],
+        "output": '{"jd_keywords": ["..."], "scores": [{"id": 1, "score": 72, "matched": ["..."], "missing": ["..."], "reason": "..."}]}',
+        "template": """You are an ATS + senior technical recruiter. Score how well each resume fits THIS job.
+Job: "{{job_title}}" at "{{job_company}}"
+Job description:
+---
+{{job_description}}
+---
+
+Resumes (id + text):
+{{resumes}}
+
+For every resume give a 0-100 score: required skills/tech stack coverage (most weight), relevant experience and projects,
+seniority fit, then keyword coverage of the JD's important terms. Be consistent: the same resume and JD must get the same score.
+"jd_keywords": the 10-25 most important skills / tools / concepts the JD asks for (short canonical names, e.g. "FastAPI", "PostgreSQL", "REST APIs").
+"missing": JD keywords that resume does not show. "matched": JD keywords it does show.
+Return ONLY raw JSON:
+{"jd_keywords": ["..."], "scores": [{"id": <id>, "score": <0-100>, "matched": ["..."], "missing": ["..."], "reason": "one short sentence"}]}""",
+    },
+    "resume_tailoring": {
+        "title": "Resume agent · tailor resume",
+        "description": "Resume agent: builds a resume tuned for this job from profile.md + details.md (the source of truth) and your best "
+                       "existing resume — swaps in the most relevant projects and surfaces JD keywords you really have. "
+                       "Anything not found in your profile is stripped automatically after generation.",
+        "variables": ["job_title", "job_company", "job_description", "category", "profile", "base_resume", "keywords", "feedback"],
+        "output": '{"label": "...", "name": "...", "headline": "...", "summary": "...", "skills": [...], "experience": [...], "projects": [...], "education": [...]}',
+        "template": """You tailor a resume for one job. The applicant's profile below is the ONLY source of truth.
+Job: "{{job_title}}" at "{{job_company}}" (resume category: {{category}})
+Job description:
+---
+{{job_description}}
+---
+
+Applicant profile (profile.md + details.md — every fact you use must come from here):
+---
+{{profile}}
+---
+
+Their current best resume for this kind of role (structure / tone reference):
+---
+{{base_resume}}
+---
+
+JD keywords the applicant REALLY has (found in the profile) but the current resume does not show — work them in where true:
+{{keywords}}
+
+Feedback from the last scoring round (may be empty): {{feedback}}
+
+Rules — follow strictly:
+- NEVER invent employers, titles, dates, degrees, projects, numbers, skills or tools. Do not add any skill that is not in the profile.
+- You MAY: reorder sections and bullets, choose which projects to show (swap in profile projects that match this JD,
+  e.g. a Python project for a Python role), rephrase bullets with the JD's wording when the profile supports it,
+  move matching skills first, and drop irrelevant items. Keep every bullet truthful to the profile.
+- Copy names, company names, school names, dates, emails, phone and links exactly as written in the profile.
+- One page worth of content: summary 2-3 lines, 3-5 bullets per role, 2-4 projects, skills grouped.
+- "label": 2-4 words naming this variant, e.g. "Python-heavy backend".
+Return ONLY raw JSON:
+{"label":"","name":"","headline":"","contact":{"email":"","phone":"","location":"","links":[]},"summary":"",
+ "skills":[{"group":"Languages","items":[]}],
+ "experience":[{"title":"","company":"","location":"","start":"","end":"","bullets":[]}],
+ "projects":[{"name":"","tech":[],"link":"","bullets":[]}],
+ "education":[{"school":"","degree":"","start":"","end":"","grade":""}],
+ "certifications":[],"achievements":[]}""",
     },
     "browser_assistant": {
         "title": "Browser assistant (your instructions)",

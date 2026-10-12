@@ -62,3 +62,23 @@ def reset_agent_prompt(key: str, user: CurrentUser, db: DbSession) -> list[dict]
     db.commit()
     db.refresh(user)
     return list_prompts(user)
+
+
+# ---- resume agent (Workflow page toggle node + settings) ---------------------
+from app.schemas.agent_config import ResumeAgentSettings  # noqa: E402
+from app.services.resume_agent import resume_agent_settings, set_resume_agent_settings  # noqa: E402
+
+
+@router.get("/resume-agent", response_model=ResumeAgentSettings)
+def get_resume_agent(user: CurrentUser) -> ResumeAgentSettings:
+    return ResumeAgentSettings(**resume_agent_settings(user))
+
+
+@router.put("/resume-agent", response_model=ResumeAgentSettings)
+def update_resume_agent(payload: ResumeAgentSettings, user: CurrentUser, db: DbSession) -> ResumeAgentSettings:
+    try:
+        saved = set_resume_agent_settings(user, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    db.commit()
+    return ResumeAgentSettings(**saved)

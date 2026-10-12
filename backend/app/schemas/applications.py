@@ -21,6 +21,7 @@ class ApplicationRead(BaseModel):
     job_id: int
     resume_key: str
     resume_role: str | None = None
+    resume_agent: dict = Field(default_factory=dict)
     status: str
     stage: str
     queue_position: int
@@ -43,6 +44,10 @@ class ApplicationRead(BaseModel):
 class ApplicationQueueRequest(BaseModel):
     job_ids: list[int] = Field(min_length=1)
     resume_key: str | None = Field(default=None, max_length=1000)
+
+
+class ApplicationResumeSwitch(BaseModel):
+    resume_key: str = Field(min_length=3, max_length=1000)
 
 
 class ApplicationQueueResponse(BaseModel):

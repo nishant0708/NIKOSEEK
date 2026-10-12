@@ -3,7 +3,7 @@ import { Background, Controls, MarkerType, MiniMap, ReactFlow, useEdgesState, us
 import '@xyflow/react/dist/style.css';
 import { Maximize2, RotateCcw, X } from 'lucide-react';
 
-type Tone = 'find' | 'agent' | 'prompt' | 'human' | 'status' | 'decision';
+type Tone = 'find' | 'agent' | 'prompt' | 'human' | 'status' | 'decision' | 'toggleOn' | 'toggleOff';
 const TONES: Record<Tone, { bg: string; border: string }> = {
   find: { bg: '#FFEEE0', border: '#F4B27E' },
   agent: { bg: '#FFF9F0', border: '#E8C9A4' },
@@ -11,23 +11,43 @@ const TONES: Record<Tone, { bg: string; border: string }> = {
   human: { bg: '#E8F1FF', border: '#8DB3E8' },
   status: { bg: '#E3F7D9', border: '#9ED28F' },
   decision: { bg: '#FFF0DE', border: '#F56A22' },
+  toggleOn: { bg: '#E3F7D9', border: '#347233' },
+  toggleOff: { bg: '#F0EBE4', border: '#A89584' },
 };
 
-function node(id: string, x: number, y: number, title: string, detail: string, tone: Tone, promptKey?: string): Node {
+// Nodes that only run while the Resume agent is ON (dimmed when it is off).
+const RESUME_NODES = new Set(['categorize', 'rscore', 'rdecide', 'tailor', 'guard', 'portal']);
+
+function node(id: string, x: number, y: number, title: string, detail: string, tone: Tone, promptKey?: string, dimmed = false): Node {
   const t = TONES[tone];
+  const toggle = tone === 'toggleOn' || tone === 'toggleOff';
   return {
     id, position: { x, y },
-    data: { label: `${title}\n${detail}`, promptKey },
+    data: { label: `${title}\n${detail}`, promptKey, toggle },
     style: {
-      width: 230, borderRadius: tone === 'decision' ? 28 : 16, border: `${tone === 'prompt' || tone === 'decision' ? 2 : 1}px solid ${t.border}`,
+      width: 230, borderRadius: tone === 'decision' || toggle ? 28 : 16, border: `${tone === 'prompt' || tone === 'decision' || toggle ? 2 : 1}px ${dimmed ? 'dashed' : 'solid'} ${t.border}`,
       background: t.bg, color: '#542914', fontWeight: 700, fontSize: 12, lineHeight: 1.35, padding: '12px 14px', whiteSpace: 'pre-line' as const,
-      cursor: promptKey ? 'pointer' : 'grab',
+      cursor: promptKey || toggle ? 'pointer' : 'grab', opacity: dimmed ? 0.45 : 1,
     },
   };
 }
 
-function buildNodes(model: string): Node[] {
+function resumeNodes(on: boolean): Node[] {
+  const off = !on;
   return [
+    node('categorize', 300, -190, '🗂️ Job category (scorer 2)', 'Same scoring call files each job under a resume folder: frontend / backend / full stack …', 'find', undefined, off),
+    node('rtoggle', 600, -190, `⚡ Resume agent: ${on ? 'ON' : 'OFF'}`, on ? 'Click to turn off. Uses extra tokens per job.' : 'Click to turn on: picks / tailors the best resume per job.', on ? 'toggleOn' : 'toggleOff'),
+    node('rscore', 900, -190, '🧠 JD ↔ resume scorer (scorer 3)', 'Scores your resumes in the job category against the real JD (read from the posting if the search had none).', 'prompt', 'resume_scoring', off),
+    node('rdecide', 1200, -190, '◆ Best score?', '≥ reuse (75): use it · tailor band (55–74): tailor · below: best existing.', 'decision', undefined, off),
+    node('tailor', 1200, -360, '🧠 Tailor resume', 'From profile.md + details.md: swap in matching projects, surface JD keywords you really have. Re-scored; best wins.', 'prompt', 'resume_tailoring', off),
+    node('guard', 1500, -360, '🛡️ Truth guard', 'Strips any skill, project, employer or number not in your profile. Saved to Resumes/<category>/.', 'agent', undefined, off),
+    node('portal', 1500, -190, '📎 Upload memory', 'Already on LinkedIn / Indeed? Selected there, not re-uploaded. Switch resume anytime in Live Workflow.', 'agent', undefined, off),
+  ];
+}
+
+function buildNodes(model: string, resumeOn = false): Node[] {
+  return [
+    ...resumeNodes(resumeOn),
     node('find', 0, 0, '🔎 Find jobs', 'JobSpy scrapes LinkedIn / Indeed with your search.', 'find'),
     node('score', 300, 0, `🧮 Match scoring`, `${model || 'model'} + shared system prompt score each job 0–100.`, 'find'),
     node('pick', 600, 0, '✅ Review & Apply selected', 'You pick jobs on the Jobs page. LinkedIn / Indeed must be connected.', 'human'),
@@ -60,8 +80,14 @@ const edge = (source: string, target: string, label?: string, dashed = false): E
   markerEnd: { type: MarkerType.ArrowClosed, color: dashed ? '#C9A27E' : '#F56A22' },
 });
 
+const RESUME_EDGES: Edge[] = [
+  edge('score', 'categorize', 'if ON', true), edge('login', 'rtoggle'), edge('rtoggle', 'rscore', 'ON'), edge('rscore', 'rdecide'),
+  edge('rdecide', 'tailor', '55–74'), edge('tailor', 'guard'), edge('guard', 'rscore', 're-score', true), edge('rdecide', 'portal', 'chosen'),
+  edge('portal', 'check1', undefined, true), edge('rtoggle', 'check1', 'OFF', true), edge('categorize', 'rscore', undefined, true),
+];
+
 const EDGES: Edge[] = [
-  edge('find', 'score'), edge('score', 'pick'), edge('pick', 'open'), edge('open', 'login'), edge('login', 'check1'),
+  edge('find', 'score'), edge('score', 'pick'), edge('pick', 'open'), edge('open', 'login'),
   edge('check1', 'easy'), edge('easy', 'ea', 'yes'), edge('easy', 'nav', 'no'), edge('nav', 'check2'), edge('check2', 'fill'),
   edge('ea', 'fill', 'each step'), edge('fill', 'answers'), edge('answers', 'submit'), edge('submit', 'statuses'),
   edge('open', 'log', undefined, true), edge('answers', 'assist', 'instruct', true),
@@ -69,20 +95,31 @@ const EDGES: Edge[] = [
   edge('pages', 'answers', 'missing answers / Review'), edge('structure', 'fill', undefined, true), edge('structure', 'pages', undefined, true),
 ];
 
-function Canvas({ model, height, onPromptClick, fullscreen }: { model: string; height: number | string; onPromptClick?: (key: string) => void; fullscreen?: boolean }) {
-  const [nodes, setNodes, onNodesChange] = useNodesState(buildNodes(model));
-  const [edges, , onEdgesChange] = useEdgesState(EDGES);
-  useEffect(() => { setNodes(current => current.map(n => n.id === 'score' ? { ...n, data: buildNodes(model).find(b => b.id === 'score')!.data } : n)); }, [model, setNodes]);
+type CanvasProps = { model: string; height: number | string; onPromptClick?: (key: string) => void; fullscreen?: boolean; resumeOn?: boolean; onToggleResume?: () => void };
+
+function Canvas({ model, height, onPromptClick, fullscreen, resumeOn = false, onToggleResume }: CanvasProps) {
+  const [nodes, setNodes, onNodesChange] = useNodesState(buildNodes(model, resumeOn));
+  const [edges, , onEdgesChange] = useEdgesState([...EDGES, ...RESUME_EDGES]);
+  // Keep dragged positions; only refresh the text / look of nodes that depend on the model or the toggle.
+  useEffect(() => {
+    const fresh = new Map(buildNodes(model, resumeOn).map(n => [n.id, n]));
+    setNodes(current => current.map(n => (n.id === 'score' || n.id === 'rtoggle' || RESUME_NODES.has(n.id)) && fresh.get(n.id)
+      ? { ...n, data: fresh.get(n.id)!.data, style: fresh.get(n.id)!.style } : n));
+  }, [model, resumeOn, setNodes]);
   return (
     <div style={{ height }} className="relative bg-[radial-gradient(circle_at_1px_1px,rgba(245,106,34,0.10)_1px,transparent_0)] bg-[length:24px_24px]">
       <ReactFlow nodes={nodes} edges={edges} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} fitView fitViewOptions={{ padding: 0.12 }}
         nodesConnectable={false} proOptions={{ hideAttribution: true }} minZoom={0.3} maxZoom={1.8}
-        onNodeClick={(_, n) => { const key = (n.data as { promptKey?: string }).promptKey; if (key && onPromptClick) onPromptClick(key); }}>
+        onNodeClick={(_, n) => {
+          const data = n.data as { promptKey?: string; toggle?: boolean };
+          if (data.toggle) { onToggleResume?.(); return; }
+          if (data.promptKey && onPromptClick) onPromptClick(data.promptKey);
+        }}>
         <Background color="#E6B98B" gap={18} size={1} />
         <Controls showInteractive={false} />
         {fullscreen && <MiniMap pannable zoomable nodeColor={n => (n.style?.background as string) ?? '#FFF9F0'} />}
       </ReactFlow>
-      <button type="button" onClick={() => setNodes(buildNodes(model))} className="absolute right-3 top-3 z-10 inline-flex items-center gap-1 rounded-full bg-white/90 px-3 py-1.5 text-xs font-bold text-[#82512D] shadow-sm hover:bg-white">
+      <button type="button" onClick={() => setNodes(buildNodes(model, resumeOn))} className="absolute right-3 top-3 z-10 inline-flex items-center gap-1 rounded-full bg-white/90 px-3 py-1.5 text-xs font-bold text-[#82512D] shadow-sm hover:bg-white">
         <RotateCcw size={13} /> Reset layout
       </button>
     </div>
@@ -90,7 +127,7 @@ function Canvas({ model, height, onPromptClick, fullscreen }: { model: string; h
 }
 
 /** Full job-search + apply pipeline. Nodes are draggable; purple nodes open their prompt editor. */
-export function PipelineDiagram({ model, onPromptClick }: { model: string; onPromptClick?: (key: string) => void }) {
+export function PipelineDiagram({ model, onPromptClick, resumeOn = false, onToggleResume }: { model: string; onPromptClick?: (key: string) => void; resumeOn?: boolean; onToggleResume?: () => void }) {
   const [open, setOpen] = useState(false);
   useEffect(() => {
     if (!open) return;
@@ -101,7 +138,7 @@ export function PipelineDiagram({ model, onPromptClick }: { model: string; onPro
 
   const legend = (
     <div className="flex flex-wrap gap-2 text-[11px] font-bold">
-      {([['find', 'Job search'], ['agent', 'Apply agent'], ['prompt', 'Editable prompt (click)'], ['human', 'You'], ['status', 'Result / log']] as [Tone, string][]).map(([tone, label]) => (
+      {([['find', 'Job search'], ['agent', 'Apply agent'], ['prompt', 'Editable prompt (click)'], ['human', 'You'], ['status', 'Result / log'], [resumeOn ? 'toggleOn' : 'toggleOff', 'Toggle (click)']] as [Tone, string][]).map(([tone, label]) => (
         <span key={tone} className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1" style={{ background: TONES[tone].bg, border: `1px solid ${TONES[tone].border}`, color: '#542914' }}>{label}</span>
       ))}
     </div>
@@ -117,7 +154,7 @@ export function PipelineDiagram({ model, onPromptClick }: { model: string; onPro
             <Maximize2 size={13} /> See full workflow
           </button>
         </div>
-        <Canvas model={model} height={520} onPromptClick={onPromptClick} />
+        <Canvas model={model} height={520} onPromptClick={onPromptClick} resumeOn={resumeOn} onToggleResume={onToggleResume} />
       </div>
 
       {open && (
@@ -130,7 +167,7 @@ export function PipelineDiagram({ model, onPromptClick }: { model: string; onPro
               <button type="button" onClick={() => setOpen(false)} className="ml-auto rounded-full p-2 text-[#82512D] hover:bg-[#FFE4C8]" aria-label="Close"><X size={18} /></button>
             </div>
             <div className="flex-1">
-              <Canvas model={model} height="100%" fullscreen onPromptClick={key => { setOpen(false); onPromptClick?.(key); }} />
+              <Canvas model={model} height="100%" fullscreen resumeOn={resumeOn} onToggleResume={onToggleResume} onPromptClick={key => { setOpen(false); onPromptClick?.(key); }} />
             </div>
           </div>
         </div>

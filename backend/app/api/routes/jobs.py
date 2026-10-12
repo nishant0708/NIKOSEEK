@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+import inspect
 import logging
 
 from fastapi import APIRouter, HTTPException, status
@@ -9,6 +10,8 @@ from app.db.models import Application, ScrapedJob, SearchRun
 from app.schemas.jobs import JobRead, JobScrapeRequest, JobScrapeResponse
 from app.services.agent_config import get_match_scoring_model, get_match_scoring_prompt
 from app.services.job_matching import attach_analysis, score_jobs_until_target
+from app.services.resume_agent import resume_agent_settings
+from app.services.resume_store import categories as resume_categories, category_choices
 from app.services.storage import read_details_markdown, read_profile_markdown
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -24,7 +27,7 @@ def row_value(row: object, name: str) -> str | None:
 def to_read(job: ScrapedJob) -> JobRead:
     # SQLAlchemy column defaults are applied during INSERT, while this helper
     # also handles new in-memory jobs before that point.
-    return JobRead(id=job.id, source=job.source, external_url=job.external_url, title=job.title, company=job.company, location=job.location, description=job.description, date_posted=job.date_posted, ai_status=job.ai_status or "PENDING", match_score=job.match_score, ai_reason=job.ai_reason, experience_match=job.experience_match)
+    return JobRead(id=job.id, source=job.source, external_url=job.external_url, title=job.title, company=job.company, location=job.location, description=job.description, date_posted=job.date_posted, ai_status=job.ai_status or "PENDING", match_score=job.match_score, ai_reason=job.ai_reason, experience_match=job.experience_match, resume_category=job.resume_category)
 
 
 @router.post("/scrape", response_model=JobScrapeResponse)
@@ -54,7 +57,11 @@ def scrape_jobs(payload: JobScrapeRequest, user: CurrentUser, db: DbSession) -> 
             "job_type": payload.job_type,
             "is_remote": bool(payload.is_remote),
             "verbose": 0,
+            # Without this JobSpy returns LinkedIn jobs with NO description, so scoring only saw the title.
+            "linkedin_fetch_description": True,
         }
+        if "fetch_description" in inspect.signature(run_scraper).parameters:  # newer JobSpy name for the same switch
+            scraper_args["fetch_description"] = True
         # JobSpy uses country_indeed to select Indeed's regional catalogue;
         # location alone is not enough for countries with the same city names.
         if "indeed" in payload.sources and payload.country_indeed:
@@ -65,14 +72,18 @@ def scrape_jobs(payload: JobScrapeRequest, user: CurrentUser, db: DbSession) -> 
             url = row_value(row, "job_url")
             if url:
                 scraped.append({"source": row_value(row, "site") or payload.sources[0], "external_url": url, "title": row_value(row, "title"), "company": row_value(row, "company"), "location": row_value(row, "location"), "description": row_value(row, "description"), "date_posted": row_value(row, "date_posted")})
-        logger.info("Search run %s: JobSpy returned %s usable jobs", run.id, len(scraped))
+        logger.info("Search run %s: JobSpy returned %s usable jobs (%s with a description)", run.id, len(scraped), sum(1 for job in scraped if job["description"]))
         if not scraped:
             run.status = "SUCCEEDED"; run.completed_at = datetime.now(UTC)
             db.commit()
             return JobScrapeResponse(run_id=run.id, accepted_jobs=[], rejected_jobs=[], fetched_count=0, saved_count=0)
         model = get_match_scoring_model(user)
         logger.info("Search run %s: scoring up to %s jobs until %s matches are accepted with model=%s", run.id, len(scraped), payload.target_relevant_count, model)
-        analyses, usage = score_jobs_until_target(scraped, profile, details, payload, model, get_match_scoring_prompt(db))
+        # Resume agent ON: the same scoring call also files each job under one of your resume folders (scorer 2).
+        categories = None
+        if resume_agent_settings(user)["enabled"]:
+            categories = category_choices(resume_categories(db, user))
+        analyses, usage = score_jobs_until_target(scraped, profile, details, payload, model, get_match_scoring_prompt(db), categories)
         by_number = {item.get("job_number"): item for item in analyses}
         accepted: list[JobRead] = []
         rejected: list[JobRead] = []
@@ -84,6 +95,7 @@ def scrape_jobs(payload: JobScrapeRequest, user: CurrentUser, db: DbSession) -> 
             job = ScrapedJob(user_id=user.id, search_run_id=run.id, **raw)
             candidate = attach_analysis(to_read(job), analysis)
             job.ai_status, job.match_score, job.ai_reason, job.experience_match = candidate.ai_status, candidate.match_score, candidate.ai_reason, candidate.experience_match
+            job.resume_category = candidate.resume_category
             # Gemini returns usage for the batch. Attribute it evenly so each job
             # retains a durable match-cost record without exposing it in the UI.
             job.llm_input_tokens = usage["input"] // max(len(analyses), 1)

@@ -37,6 +37,7 @@ function Card({ job, selected, selectable, onToggle }: { job: Job; selected?: bo
             </div>
             <div className="flex shrink-0 items-center gap-1.5">
               <span className="rounded-full bg-[#FFF0DE] px-2 py-1 text-[10px] font-black uppercase tracking-[.1em] text-[#92502A]">{job.source}</span>
+              {job.resume_category && <span title="Resume category (resume agent)" className="rounded-full bg-[#F4ECFF] px-2 py-1 text-[10px] font-black text-[#7A3FB8]">{job.resume_category}</span>}
               <b className={`rounded-full px-2 py-1 text-[10px] ${job.ai_status === 'ACCEPTED' ? 'bg-[#DDF4D5] text-[#347233]' : 'bg-[#FFE1D6] text-[#AD3212]'}`}>
                 {job.match_score?.toFixed(0) ?? 0}% match
               </b>

@@ -5,18 +5,20 @@ import {
   LoaderCircle, Radio, Workflow as WorkflowIcon,
   ChevronDown, ChevronRight, AlertTriangle, Eye, X,
   Brain, MousePointerClick, Info, CircleAlert, Flag, Crosshair, CircleHelp,
-  Bell, BriefcaseBusiness, ExternalLink, Maximize2, Minimize2, MonitorPlay, ListChecks, Inbox,
+  Bell, BriefcaseBusiness, ExternalLink, Maximize2, Minimize2, MonitorPlay, ListChecks, Inbox, FileText,
 } from 'lucide-react';
 import { ApplicationFormPanel } from '../components/workflow/ApplicationFormPanel';
 import { StatusActions } from '../components/workflow/StatusActions';
 import { LiveBrowserPanel } from '../components/workflow/LiveBrowserPanel';
 import { AgentQuestionCard } from '../components/workflow/AgentQuestionCard';
 import { InstructAgent } from '../components/workflow/InstructAgent';
+import { ResumePanel } from '../components/workflow/ResumePanel';
 import { api, type AgentEvent, type AgentStageKey, type Application, type BrowserFrame, type ManualStatus } from '../lib/api';
 
 const STAGE_NODES = [
   { id: 'open', label: 'Opening job page', detail: 'Open the posting in your {provider} window.' },
   { id: 'login', label: 'Checking {provider} login', detail: 'Reuse the connected session; if it expired, finish login there.' },
+  { id: 'resume', label: 'Resume agent', detail: 'Reads the JD on the posting, scores your resumes against it; tailors one from your profile when it helps.' },
   { id: 'find', label: 'Finding apply button', detail: 'Easy Apply / Indeed Apply, or Apply → company site (Workday & co: sign up / sign in for you). Stuck? It asks you.' },
   { id: 'fields', label: 'Filling the form', detail: 'AI fills what your profile answers (Easy Apply: step by step) + resume.' },
   { id: 'review', label: 'Your answers & submit', detail: 'Fill the missing answers below, then press Submit.' },
@@ -69,11 +71,13 @@ function nodeStyle(state: 'pending' | 'active' | 'done' | 'alert') {
 
 function stageIndexFromText(stage?: string | null) {
   const value = (stage ?? '').toLowerCase();
-  if (value.includes('opening')) return 0;
-  if (value.includes('login')) return 1;
-  if (value.includes('finding') || value.includes('navigating') || value.includes('found apply')) return 2;
-  if (value.includes('fetching') || value.includes('filling')) return 3;
-  if (value.includes('review')) return 4;
+  const at = (key: AgentStageKey) => STAGE_ORDER.indexOf(key);
+  if (value.startsWith('resume agent')) return at('resume');
+  if (value.includes('opening')) return at('open');
+  if (value.includes('login')) return at('login');
+  if (value.includes('finding') || value.includes('navigating') || value.includes('found apply')) return at('find');
+  if (value.includes('fetching') || value.includes('filling')) return at('fields');
+  if (value.includes('review')) return at('review');
   return -1;
 }
 
@@ -193,7 +197,7 @@ function QueueGroup({ title, applications, selectedId, onSelect, alert }: {
 type TileMode = 'normal' | 'expanded' | 'collapsed';
 const TILE_KEY = 'nikoseek.liveTiles';
 // Default layout: Job details and Agent log full width; Live flow and Live browser side by side under them.
-const DEFAULT_TILES: Record<string, TileMode> = { details: 'expanded', log: 'expanded', flow: 'normal', browser: 'normal' };
+const DEFAULT_TILES: Record<string, TileMode> = { details: 'expanded', log: 'expanded', flow: 'normal', browser: 'normal', resume: 'normal' };
 
 function readTiles(): Record<string, TileMode> {
   try { return JSON.parse(window.localStorage.getItem(TILE_KEY) ?? '{}') as Record<string, TileMode>; } catch { return {}; }
@@ -418,11 +422,14 @@ export function LiveWorkflow({ token }: { token: string }) {
     return fromEvents >= 0 ? fromEvents : stageIndexFromText(selectedApp.stage);
   }, [selectedApp, events, isFailed, isReview, isSubmitted]);
 
+  // The resume node only lights up when the resume agent actually ran for this job (it is optional).
+  const resumeRan = events.some(item => item.stage_key === 'resume') || Boolean(selectedApp?.resume_agent?.status || selectedApp?.resume_agent?.pinned);
   const nodes: Node[] = useMemo(() => {
     const stageNodes: Node[] = STAGE_NODES.map((node, index) => {
       let state: 'pending' | 'active' | 'done' | 'alert' = 'pending';
       let label: string = node.label;
-      if (isFailed && currentIndex === index) state = 'alert';
+      if (node.id === 'resume' && !resumeRan) label = `${label} (off for this job)`;
+      else if (isFailed && currentIndex === index) state = 'alert';
       else if (isReview && index === currentIndex) state = 'alert';
       else if (currentIndex > index) { state = 'done'; label = `✅ ${label}`; }
       else if (currentIndex === index && isRunning) { state = 'active'; label = `⏳ ${label}`; }
@@ -452,7 +459,7 @@ export function LiveWorkflow({ token }: { token: string }) {
       });
     });
     return [...stageNodes, ...logNodes];
-  }, [events, currentIndex, isFailed, isReview, isRunning, provider]);
+  }, [events, currentIndex, isFailed, isReview, isRunning, provider, resumeRan]);
 
   const flowEdges: Edge[] = useMemo(() => {
     const stageEdges: Edge[] = STAGE_NODES.slice(0, -1).map((node, index) => ({
@@ -593,7 +600,7 @@ export function LiveWorkflow({ token }: { token: string }) {
                       <Detail label="Location">{job?.location ?? '—'}</Detail>
                       <Detail label="Job board">{job?.source ?? '—'}</Detail>
                       <Detail label="Match">{job?.match_score != null ? `${job.match_score.toFixed(0)}% · ${job.ai_status.toLowerCase()}` : '—'}</Detail>
-                      <Detail label="Resume used">{selectedApp.resume_role ?? '—'}</Detail>
+                      <Detail label="Resume used">{selectedApp.resume_agent?.chosen_label ?? selectedApp.resume_role ?? '—'}</Detail>
                       <Detail label="Queue">#{selectedApp.queue_position}</Detail>
                       <Detail label="Queued">{fmtDate(selectedApp.created_at)}</Detail>
                       <Detail label="Started">{fmtDate(selectedApp.started_at)}</Detail>
@@ -624,6 +631,10 @@ export function LiveWorkflow({ token }: { token: string }) {
                         <Controls showInteractive={false} />
                       </ReactFlow>
                     </div>
+                  </Tile>
+
+                  <Tile title="Resume" icon={<FileText size={16} />} mode={tileMode('resume')} onMode={setTile('resume')}>
+                    <ResumePanel token={token} application={selectedApp} onUpdated={upsertApplication} height={tileMode('resume') === 'expanded' ? 820 : 420} />
                   </Tile>
 
                   <Tile title="Live browser" icon={<MonitorPlay size={16} />} mode={tileMode('browser')} onMode={setTile('browser')}>
