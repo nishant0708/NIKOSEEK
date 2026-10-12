@@ -126,6 +126,29 @@ def save_resume(username: str, role: str, upload: UploadFile) -> str:
     return key
 
 
+def save_generated_resume(username: str, role: str, data: bytes, extension: str = ".pdf") -> str:
+    """Store a resume the resume agent generated next to your own ones: <user>/Resumes/<role>/resume_<digest>.pdf."""
+    if extension not in ALLOWED_RESUME_TYPES:
+        raise ValueError("Unsupported resume type")
+    magic, content_type = ALLOWED_RESUME_TYPES[extension]
+    if not data.startswith(magic) or len(data) > 5 * 1024 * 1024:
+        raise ValueError("Generated resume is not a valid file")
+    key = _key(username, "Resumes", _safe_part(role), f"resume_{sha256(data).hexdigest()[:24]}{extension}")
+    _upload(key, data, content_type)
+    return key
+
+
+def resume_belongs_to(username: str, key: str) -> bool:
+    """Only keys inside the caller's own Resumes/ prefix, no path tricks."""
+    prefix = f"{_safe_part(username)}/Resumes/"
+    return bool(key) and key.startswith(prefix) and ".." not in key and "//" not in key and key.endswith((".pdf", ".docx"))
+
+
+def resume_role_of(key: str) -> str | None:
+    parts = key.split("/")
+    return parts[2] if len(parts) >= 4 else None
+
+
 def has_resume(username: str) -> bool:
     """Return whether any role folder contains an uploaded resume object."""
     bucket = _client().storage.from_(settings.supabase_storage_bucket)

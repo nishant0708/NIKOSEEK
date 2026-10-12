@@ -181,7 +181,8 @@ async def _upload_resume_step(page, log) -> bool:
     if not uploaded:
         if not _again(page, "upload"):
             return False
-        name = await upload_resume(frame, getattr(application, "resume_key", None), application.user.username if application else "applicant")
+        name = await upload_resume(frame, getattr(application, "resume_key", None), application.user.username if application else "applicant",
+                                   user_id=getattr(application, "user_id", None))
         if not name:
             return False
         await log("action", f"Uploaded your resume ({name}) for Workday's autofill.", data={"url": page.url})

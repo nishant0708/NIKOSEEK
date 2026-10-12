@@ -47,12 +47,14 @@ from app.services.indeed_browser import (
     IndeedAuthRequired,
     indeed_browser,
 )
-from app.services.storage import list_resumes
+from app.services.resume_agent import load_resume_rows, pin_resume, resume_agent_settings, run_resume_agent
+from app.services.storage import list_resumes, resume_belongs_to, resume_role_of
 from app.ws.broker import broker
 
 logger = logging.getLogger(__name__)
 
 # Stage labels — LiveWorkflow.tsx maps these (by substring) onto its flow nodes.
+STAGE_RESUME = "Resume agent — choosing the best resume for this job"
 STAGE_OPENING = "Opening job page"
 STAGE_LOGIN_CHECK = "Checking {provider} login"
 STAGE_LOGIN_WAIT = "Waiting for {provider} login in the browser window"
@@ -82,6 +84,7 @@ def serialize_application(application: Application) -> dict:
         "job_id": application.job_id,
         "resume_key": application.resume_key,
         "resume_role": application.resume_role,
+        "resume_agent": dict(application.resume_agent or {}),
         "status": application.status,
         "stage": application.stage,
         "queue_position": application.queue_position,
@@ -116,10 +119,9 @@ def serialize_application(application: Application) -> dict:
 # ---------------------------------------------------------------------------
 def choose_resume(username: str, requested_key: str | None) -> tuple[str, str | None]:
     if requested_key:
-        if not requested_key.startswith(f"{username.lower()}/Resumes/"):
+        if not resume_belongs_to(username, requested_key):
             raise ValueError("That resume does not belong to you")
-        parts = requested_key.split("/")
-        return requested_key, (parts[2] if len(parts) >= 4 else None)
+        return requested_key, resume_role_of(requested_key)
     resumes = list_resumes(username)
     if not resumes:
         raise ValueError("Upload a resume before applying to jobs")
@@ -171,6 +173,10 @@ def enqueue_applications(db: Session, user: User, job_ids: list[int], resume_key
         application.applied_at = None
         application.application_url = None
         application.form_data = {}
+        # A resume you chose (Retry / API) is pinned; otherwise the resume agent (when ON) decides at run time.
+        application.resume_agent = {}
+        if resume_key:
+            pin_resume(application, chosen_resume_key, None)
         application.queue_position = max_position + offset
         application.job = job
         job.application_status = "QUEUED"
@@ -269,6 +275,20 @@ async def _run_pipeline(run: _Run, user: User) -> None:
     await relogin(page)
     if source == LINKEDIN and not page.is_closed() and "/jobs/view/" not in page.url:
         await page.goto(job_url, wait_until="domcontentloaded", timeout=60000)
+
+    # 2b. Resume agent (Workflow page toggle): score your resumes against this JD, tailor one if it's worth it.
+    #     Runs on the open posting so a missing JD (older LinkedIn searches) can be read from the page.
+    if resume_agent_settings(user)["enabled"]:
+        await run.stage("resume", STAGE_RESUME)
+        try:
+            await run_resume_agent(db, user, application, log, page=page)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Resume agent failed for application %s", application.id)
+            db.rollback()
+            await log("warning", f"Resume agent failed ({str(exc).splitlines()[0][:160]}) — continuing with {application.resume_role or 'your resume'}.")
+        await run.publish()
 
     # 3. Reach the form: Easy Apply dialog or the company's site (AI-guided, wrong-tab guarded).
     await run.stage("find", STAGE_FINDING)
@@ -488,3 +508,42 @@ async def recheck_form(db: Session, user: User, application_id: int, websocket_b
         if session.stepped and not snap["missing_required"] and snap["has_next"]:
             snap = await session.autofill(user, application.job, run.log, snap)
     return await _finish_action(db, application, run, snap)
+
+
+async def switch_resume(db: Session, user: User, application_id: int, resume_key: str, websocket_broker=broker) -> tuple[dict, str]:
+    """Use a different resume for one application (Live Workflow → Resume tile). Pins it so the agent won't override it."""
+    application = (
+        db.query(Application).options(joinedload(Application.job))
+        .filter(Application.id == application_id, Application.user_id == user.id).one_or_none()
+    )
+    if application is None:
+        raise FormActionError("Application not found", 404)
+    if application.status in (SUBMITTED, "COMPLETED", "REJECTED"):
+        raise FormActionError("This application is already closed.")
+    if not resume_belongs_to(user.username, resume_key):
+        raise FormActionError("That resume does not belong to you", 403)
+    rows = await asyncio.to_thread(load_resume_rows, user.id)
+    row = next((r for r in rows if r.storage_key == resume_key), None)
+    if row is None:
+        raise FormActionError("Resume not found", 404)
+    application.resume_key = row.storage_key
+    application.resume_role = row.category
+    application.job.resume_key = row.storage_key
+    application.job.resume_role = row.category
+    pin_resume(application, row.storage_key, row.label)
+    run = _Run(db, application, websocket_broker, continue_attempt=True)
+    session = form_sessions.get(application_id)
+    if session is None or not session.is_open:
+        later = application.status in ("PENDING", "IN_PROGRESS")
+        await run.log("info", f"Resume switched to {row.label}." + (" Used when the form opens." if later else " Press Retry to apply with it."))
+        await run.publish()
+        return serialize_application(application), ("queued" if later else "retry")
+    async with session.lock:
+        snap, attached = await session.switch_resume(row.storage_key, user, run.log)
+    if not attached:
+        await run.log("warning", f"Resume switched to {row.label}, but this step has no resume field. "
+                      "Go back to the resume step (instruct the agent: “go back to the resume step”) or press Retry.")
+    application.form_data = snap
+    await run.publish()
+    return serialize_application(application), ("attached" if attached else "not_on_this_step")
+

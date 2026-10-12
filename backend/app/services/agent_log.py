@@ -15,7 +15,7 @@ from app.services.llm import TokenMeter, current_meter
 
 logger = logging.getLogger(__name__)
 
-STAGE_KEYS = ("open", "login", "find", "fields", "review", "failed")
+STAGE_KEYS = ("resume", "open", "login", "find", "fields", "review", "failed")
 
 
 def serialize_event(event: ApplicationEvent) -> dict:

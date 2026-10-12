@@ -29,6 +29,7 @@ class JobRead(BaseModel):
     match_score: float | None = None
     ai_reason: str | None = None
     experience_match: str | None = None
+    resume_category: str | None = None
 
 
 class JobScrapeResponse(BaseModel):

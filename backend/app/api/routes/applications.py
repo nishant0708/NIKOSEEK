@@ -10,11 +10,11 @@ from sqlalchemy.orm import joinedload
 from app.api.deps import CurrentUser, DbSession
 from app.core.config import settings
 from app.db.models import Application, User
-from app.schemas.applications import ApplicationAnswer, ApplicationFieldValues, ApplicationInstruction, ApplicationStatusUpdate, BrowserInput, ApplicationQueueRequest, ApplicationQueueResponse, ApplicationRead
+from app.schemas.applications import ApplicationAnswer, ApplicationFieldValues, ApplicationInstruction, ApplicationResumeSwitch, ApplicationStatusUpdate, BrowserInput, ApplicationQueueRequest, ApplicationQueueResponse, ApplicationRead
 from app.services.agent_log import list_events, serialize_event
 from app.services.applications import (
     FormActionError, answer_question, application_connection_error, continue_form, enqueue_applications, fill_from_user, instruct_form, recheck_form,
-    serialize_application, set_application_status, submit_form,
+    serialize_application, set_application_status, submit_form, switch_resume,
 )
 from app.services.live_view import live_view
 from app.db.session import SessionLocal
@@ -112,6 +112,17 @@ async def recheck_application(application_id: int, user: CurrentUser, db: DbSess
 async def instruct_application(application_id: int, payload: ApplicationInstruction, user: CurrentUser, db: DbSession) -> ApplicationRead:
     """Tell the agent what to do on the open form, in your own words."""
     return await _form_action(instruct_form(db, user, application_id, payload.instruction.strip()))
+
+
+@router.post("/{application_id}/resume")
+async def switch_application_resume(application_id: int, payload: ApplicationResumeSwitch, user: CurrentUser, db: DbSession) -> dict:
+    """Use another of your resumes for this job (pinned: the resume agent won't override it).
+    result: attached (re-attached on the open form) | not_on_this_step | queued | retry."""
+    try:
+        application, result = await switch_resume(db, user, application_id, payload.resume_key)
+    except FormActionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return {"application": ApplicationRead.model_validate(application).model_dump(mode="json"), "result": result}
 
 
 @router.post("/{application_id}/browser/input")
