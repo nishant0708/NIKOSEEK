@@ -6,7 +6,7 @@ import { Input } from '../components/ui/input';
 import { api, INDEED_NOT_CONNECTED, LINKEDIN_NOT_CONNECTED, type Job } from '../lib/api';
 
 type View = 'all' | 'linkedin' | 'indeed' | 'search';
-type Verdict = 'accepted' | 'rejected';
+type Verdict = 'accepted' | 'rejected' | 'pending';
 
 function jobKey(job: Job) {
   return String(job.id ?? job.external_url);
@@ -18,7 +18,7 @@ function mergeJobs(fresh: Job[], existing: Job[]) {
   return [...fresh, ...existing.filter(job => !seen.has(jobKey(job)))];
 }
 
-function Card({ job, selected, selectable, onToggle }: { job: Job; selected?: boolean; selectable?: boolean; onToggle?: () => void }) {
+function Card({ job, selected, selectable, onToggle, onScore, scoring }: { job: Job; selected?: boolean; selectable?: boolean; onToggle?: () => void; onScore?: () => void; scoring?: boolean }) {
   return (
     <article className={`rounded-2xl border bg-[#FFF9F0] p-5 transition hover:border-orange hover:shadow-soft ${selected ? 'border-orange shadow-soft' : 'border-[#EBCDAA]'}`}>
       <div className="flex items-start gap-3">
@@ -30,16 +30,16 @@ function Card({ job, selected, selectable, onToggle }: { job: Job; selected?: bo
           <BriefcaseBusiness className="mt-1 text-orange" />
         )}
         <div className="min-w-0 flex-1">
-          <div className="flex items-start justify-between gap-3">
+          <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start sm:justify-between sm:gap-3">
             <div className="min-w-0">
               <h3 className="truncate font-black">{job.title}</h3>
               <p className="mt-1 text-sm text-[#865D42]">{job.company} · {job.location}</p>
             </div>
-            <div className="flex shrink-0 items-center gap-1.5">
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
               <span className="rounded-full bg-[#FFF0DE] px-2 py-1 text-[10px] font-black uppercase tracking-[.1em] text-[#92502A]">{job.source}</span>
               {job.resume_category && <span title="Resume category (resume agent)" className="rounded-full bg-[#F4ECFF] px-2 py-1 text-[10px] font-black text-[#7A3FB8]">{job.resume_category}</span>}
-              <b className={`rounded-full px-2 py-1 text-[10px] ${job.ai_status === 'ACCEPTED' ? 'bg-[#DDF4D5] text-[#347233]' : 'bg-[#FFE1D6] text-[#AD3212]'}`}>
-                {job.match_score?.toFixed(0) ?? 0}% match
+              <b className={`rounded-full px-2 py-1 text-[10px] ${job.ai_status === 'ACCEPTED' ? 'bg-[#DDF4D5] text-[#347233]' : job.ai_status === 'PENDING' ? 'bg-[#FFF0BD] text-[#805940]' : 'bg-[#FFE1D6] text-[#AD3212]'}`}>
+                {job.ai_status === 'PENDING' ? 'Pending score' : `${job.match_score?.toFixed(0) ?? 0}% match`}
               </b>
             </div>
           </div>
@@ -49,6 +49,12 @@ function Card({ job, selected, selectable, onToggle }: { job: Job; selected?: bo
               className="inline-flex items-center gap-1 rounded-full bg-[#FFE4C8] px-3 py-1.5 text-xs font-bold text-[#82512D] transition hover:bg-[#FFD7AE]">
               Open posting <ExternalLink size={13} />
             </a>
+            {job.ai_status === 'PENDING' && onScore && (
+              <Button type="button" size="sm" onClick={onScore} disabled={scoring}>
+                {scoring ? <LoaderCircle className="animate-spin" size={15} /> : <Sparkles size={15} />}
+                {scoring ? 'Scoring…' : 'Score now'}
+              </Button>
+            )}
           </div>
         </div>
       </div>
@@ -96,6 +102,7 @@ export function JobSearch({ token }: { token: string }) {
   const [selectedJobs, setSelectedJobs] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [applyBusy, setApplyBusy] = useState(false);
+  const [scoringJobId, setScoringJobId] = useState<number | null>(null);
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -117,10 +124,11 @@ export function JobSearch({ token }: { token: string }) {
         experience,
         min_salary_lpa: salary ? Number(salary) : null,
         target_relevant_count: Number(wanted),
-        results_wanted: 30,
+        // Fetch a candidate pool larger than the requested accepted match count.
+        results_wanted: Math.min(100, Math.max(30, Number(wanted) * 10)),
         hours_old: 168,
       });
-      const fresh = [...result.accepted_jobs, ...result.rejected_jobs];
+      const fresh = [...result.accepted_jobs, ...result.rejected_jobs, ...result.pending_jobs];
       setAllJobs(current => mergeJobs(fresh, current));
       setLastSearch({ term, source, jobs: fresh });
       setVerdict('accepted');
@@ -142,9 +150,12 @@ export function JobSearch({ token }: { token: string }) {
   }, [base, filter]);
   const accepted = filtered.filter(job => job.ai_status === 'ACCEPTED');
   const rejected = filtered.filter(job => job.ai_status === 'REJECTED');
-  const shown = verdict === 'rejected' ? rejected : accepted;
+  const pending = filtered.filter(job => job.ai_status === 'PENDING');
+  const shown = verdict === 'rejected' ? rejected : verdict === 'pending' ? pending : accepted;
   const selectedAccepted = accepted.filter(job => selectedJobs.includes(jobKey(job)));
+  const selectedPending = pending.filter(job => selectedJobs.includes(jobKey(job)));
   const allSelected = accepted.length > 0 && selectedAccepted.length === accepted.length;
+  const allPendingSelected = pending.length > 0 && selectedPending.length === pending.length;
   const counts = {
     all: allJobs.length,
     linkedin: allJobs.filter(job => job.source?.toLowerCase() === 'linkedin').length,
@@ -176,11 +187,44 @@ export function JobSearch({ token }: { token: string }) {
     }
   }
 
+  async function scoreJob(job: Job) {
+    if (typeof job.id !== 'number') return;
+    setScoringJobId(job.id);
+    setError('');
+    try {
+      const scored = await api.scoreJob(token, job.id);
+      setAllJobs(current => current.map(item => item.id === scored.id ? scored : item));
+      setLastSearch(current => current && ({ ...current, jobs: current.jobs.map(item => item.id === scored.id ? scored : item) }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not score this job.');
+    } finally {
+      setScoringJobId(null);
+    }
+  }
+
+  async function scoreSelectedPending() {
+    const jobsToScore = selectedPending.filter(job => typeof job.id === 'number');
+    if (!jobsToScore.length) return;
+    setScoringJobId(-1);
+    setError('');
+    try {
+      const scored = await api.scoreJobs(token, jobsToScore.map(job => job.id!));
+      const scoredById = new Map(scored.map(job => [job.id, job]));
+      setAllJobs(current => current.map(job => scoredById.get(job.id) ?? job));
+      setLastSearch(current => current && ({ ...current, jobs: current.jobs.map(job => scoredById.get(job.id) ?? job) }));
+      setSelectedJobs([]);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not score the selected jobs.');
+    } finally {
+      setScoringJobId(null);
+    }
+  }
+
   const title = { all: 'All jobs', linkedin: 'LinkedIn jobs', indeed: 'Indeed jobs', search: 'Search' }[view];
 
   return (
     <main className="min-h-screen bg-cream px-5 py-7">
-      <div className="mx-auto flex max-w-7xl flex-col gap-6 lg:flex-row">
+      <div className="mx-auto flex p-2 flex-col gap-6 lg:flex-row">
         <aside className="lg:sticky lg:top-24 lg:h-fit lg:w-60 lg:shrink-0">
           <div className="rounded-[1.75rem] border border-[#EBCDAA] bg-[#FFF9F0] p-3">
             <p className="px-3 pb-2 pt-1 text-[11px] font-black uppercase tracking-[.16em] text-orange">Jobs</p>
@@ -252,11 +296,23 @@ export function JobSearch({ token }: { token: string }) {
               <div className="mt-5 flex flex-wrap items-center gap-2">
                 <button onClick={() => setVerdict('accepted')} className={`rounded-full px-4 py-2 text-sm font-bold ${verdict === 'accepted' ? 'bg-orange text-white' : 'bg-[#FFE4C8]'}`}>Accepted ({accepted.length})</button>
                 <button onClick={() => setVerdict('rejected')} className={`rounded-full px-4 py-2 text-sm font-bold ${verdict === 'rejected' ? 'bg-[#A54222] text-white' : 'bg-[#FFE4C8]'}`}>Rejected ({rejected.length})</button>
+                <button onClick={() => setVerdict('pending')} className={`rounded-full px-4 py-2 text-sm font-bold ${verdict === 'pending' ? 'bg-[#805940] text-white' : 'bg-[#FFE4C8]'}`}>Pending score ({pending.length})</button>
                 <div className="relative min-w-[200px] flex-1 sm:max-w-xs">
                   <Filter size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#A16A45]" />
                   <input value={filter} onChange={e => setFilter(e.target.value)} placeholder="Filter by title, company, place"
                     className="h-10 w-full rounded-full border border-[#E7BD91] bg-white pl-8 pr-3 text-sm outline-none focus:border-orange" />
                 </div>
+                {verdict === 'pending' && pending.length > 0 && (
+                  <div className="ml-auto flex flex-wrap gap-2">
+                    <Button type="button" variant="secondary" size="sm" onClick={() => setSelectedJobs(allPendingSelected ? [] : pending.map(jobKey))} className="bg-[#FFE4C8] text-[#82512D] hover:bg-[#FFD7AE]">
+                      {allPendingSelected ? 'Clear selection' : 'Select all'}
+                    </Button>
+                    <Button type="button" size="sm" onClick={scoreSelectedPending} disabled={!selectedPending.length || scoringJobId !== null}>
+                      {scoringJobId === -1 ? <LoaderCircle className="animate-spin" /> : <Sparkles size={15} />}
+                      Score selected ({selectedPending.length})
+                    </Button>
+                  </div>
+                )}
                 {verdict === 'accepted' && accepted.length > 0 && (
                   <div className="ml-auto flex flex-wrap gap-2">
                     <Button type="button" variant="secondary" size="sm" onClick={() => setSelectedJobs(allSelected ? [] : accepted.map(jobKey))} className="bg-[#FFE4C8] text-[#82512D] hover:bg-[#FFD7AE]">
@@ -271,8 +327,9 @@ export function JobSearch({ token }: { token: string }) {
               </div>
               <div className="mt-4 grid gap-3">
                 {shown.map((job, index) => (
-                  <Card key={job.id ?? index} job={job} selectable={verdict === 'accepted' && job.ai_status === 'ACCEPTED'}
-                    selected={selectedJobs.includes(jobKey(job))} onToggle={() => toggleJob(job)} />
+                  <Card key={job.id ?? index} job={job} selectable={(verdict === 'accepted' && job.ai_status === 'ACCEPTED') || (verdict === 'pending' && job.ai_status === 'PENDING')}
+                    selected={selectedJobs.includes(jobKey(job))} onToggle={() => toggleJob(job)}
+                    onScore={verdict === 'pending' ? () => scoreJob(job) : undefined} scoring={scoringJobId === job.id || scoringJobId === -1} />
                 ))}
                 {!shown.length && <p className="rounded-2xl bg-[#FFF9F0] p-6 text-sm font-bold text-[#805940]">{filter ? 'No jobs match this filter.' : 'No jobs here yet — use Search to find some.'}</p>}
               </div>

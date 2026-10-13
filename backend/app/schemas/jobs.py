@@ -32,9 +32,14 @@ class JobRead(BaseModel):
     resume_category: str | None = None
 
 
+class JobScoreRequest(BaseModel):
+    job_ids: list[int] = Field(min_length=1, max_length=100)
+
+
 class JobScrapeResponse(BaseModel):
     run_id: int
     accepted_jobs: list[JobRead]
     rejected_jobs: list[JobRead]
+    pending_jobs: list[JobRead] = Field(default_factory=list)
     fetched_count: int
     saved_count: int

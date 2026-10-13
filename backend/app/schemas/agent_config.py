@@ -33,3 +33,7 @@ class ResumeAgentSettings(BaseModel):
     tailor_min: int = Field(default=55, ge=0, le=99)
     max_rounds: int = Field(default=2, ge=1, le=3)
     model: str = Field(default="", max_length=120)
+
+
+class AutoSubmitSettings(BaseModel):
+    enabled: bool = False

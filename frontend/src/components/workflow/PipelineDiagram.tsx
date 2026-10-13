@@ -3,7 +3,7 @@ import { Background, Controls, MarkerType, MiniMap, ReactFlow, useEdgesState, us
 import '@xyflow/react/dist/style.css';
 import { Maximize2, RotateCcw, X } from 'lucide-react';
 
-type Tone = 'find' | 'agent' | 'prompt' | 'human' | 'status' | 'decision' | 'toggleOn' | 'toggleOff';
+type Tone = 'find' | 'agent' | 'prompt' | 'human' | 'status' | 'decision' | 'toggleOn' | 'toggleOff' | 'autoOn' | 'autoOff';
 const TONES: Record<Tone, { bg: string; border: string }> = {
   find: { bg: '#FFEEE0', border: '#F4B27E' },
   agent: { bg: '#FFF9F0', border: '#E8C9A4' },
@@ -13,14 +13,16 @@ const TONES: Record<Tone, { bg: string; border: string }> = {
   decision: { bg: '#FFF0DE', border: '#F56A22' },
   toggleOn: { bg: '#E3F7D9', border: '#347233' },
   toggleOff: { bg: '#F0EBE4', border: '#A89584' },
+  autoOn: { bg: '#E3F7D9', border: '#347233' },
+  autoOff: { bg: '#FFF0DE', border: '#D4A06F' },
 };
 
 // Nodes that only run while the Resume agent is ON (dimmed when it is off).
 const RESUME_NODES = new Set(['categorize', 'rscore', 'rdecide', 'tailor', 'guard', 'portal']);
 
-function node(id: string, x: number, y: number, title: string, detail: string, tone: Tone, promptKey?: string, dimmed = false): Node {
+function node(id: string, x: number, y: number, title: string, detail: string, tone: Tone, promptKey?: string, dimmed = false, toggleKey?: 'resume' | 'auto_submit'): Node {
   const t = TONES[tone];
-  const toggle = tone === 'toggleOn' || tone === 'toggleOff';
+  const toggle = toggleKey;
   return {
     id, position: { x, y },
     data: { label: `${title}\n${detail}`, promptKey, toggle },
@@ -36,7 +38,7 @@ function resumeNodes(on: boolean): Node[] {
   const off = !on;
   return [
     node('categorize', 300, -190, '🗂️ Job category (scorer 2)', 'Same scoring call files each job under a resume folder: frontend / backend / full stack …', 'find', undefined, off),
-    node('rtoggle', 600, -190, `⚡ Resume agent: ${on ? 'ON' : 'OFF'}`, on ? 'Click to turn off. Uses extra tokens per job.' : 'Click to turn on: picks / tailors the best resume per job.', on ? 'toggleOn' : 'toggleOff'),
+    node('rtoggle', 600, -190, `⚡ Resume agent: ${on ? 'ON' : 'OFF'}`, on ? 'Click to turn off. Uses extra tokens per job.' : 'Click to turn on: picks / tailors the best resume per job.', on ? 'toggleOn' : 'toggleOff', undefined, false, 'resume'),
     node('rscore', 900, -190, '🧠 JD ↔ resume scorer (scorer 3)', 'Scores your resumes in the job category against the real JD (read from the posting if the search had none).', 'prompt', 'resume_scoring', off),
     node('rdecide', 1200, -190, '◆ Best score?', '≥ reuse (75): use it · tailor band (55–74): tailor · below: best existing.', 'decision', undefined, off),
     node('tailor', 1200, -360, '🧠 Tailor resume', 'From profile.md + details.md: swap in matching projects, surface JD keywords you really have. Re-scored; best wins.', 'prompt', 'resume_tailoring', off),
@@ -45,7 +47,7 @@ function resumeNodes(on: boolean): Node[] {
   ];
 }
 
-function buildNodes(model: string, resumeOn = false): Node[] {
+function buildNodes(model: string, resumeOn = false, autoSubmitOn = false): Node[] {
   return [
     ...resumeNodes(resumeOn),
     node('find', 0, 0, '🔎 Find jobs', 'JobSpy scrapes LinkedIn / Indeed with your search.', 'find'),
@@ -60,8 +62,9 @@ function buildNodes(model: string, resumeOn = false): Node[] {
     node('check2', 600, 340, '🧠 Correct-page check', 'Form tab verified before anything is typed.', 'prompt', 'page_verification'),
     node('fill', 300, 510, '🧠 Form filling', 'Maps profile.md + details.md onto empty fields; unknown → ASK_USER. Attaches resume.', 'prompt', 'form_mapping'),
     node('answers', 600, 510, '🙋 Your answers', 'Live Workflow: fill missing fields & dropdowns, instruct the agent, or click in the live browser view.', 'human'),
-    node('submit', 900, 510, '📨 Submit (you press it)', 'Only enabled when every required field is filled.', 'human'),
-    node('statuses', 900, 680, '🏁 Statuses', 'Submitted · Completed · Rejected · Failed (manual moves from the queue).', 'status'),
+    node('submit', 900, 510, '📨 Submit (you press it)', 'Manual submission when automatic submission is off.', 'human'),
+    node('autosubmit', 1200, 510, `⚡ Auto submit: ${autoSubmitOn ? 'ON' : 'OFF'}`, autoSubmitOn ? 'Enabled in Workflow settings. Submits complete applications; pauses when required answers are missing.' : 'Click to enable in Workflow settings. Complete applications submit without a review step.', autoSubmitOn ? 'autoOn' : 'autoOff', undefined, false, 'auto_submit'),
+    node('statuses', 1200, 680, '🏁 Statuses', 'Submitted · Completed · Rejected · Failed (manual moves from the queue).', 'status'),
     node('assist', 300, 680, '🧠 Browser assistant', 'Turns your typed instructions into clicks / field fills.', 'prompt', 'browser_assistant'),
     node('log', 900, 170, '📜 Agent log + tokens', 'Every AI decision, action and token count is saved per attempt.', 'status'),
     // Company portals (Workday, iCIMS, Taleo …)
@@ -89,37 +92,38 @@ const RESUME_EDGES: Edge[] = [
 const EDGES: Edge[] = [
   edge('find', 'score'), edge('score', 'pick'), edge('pick', 'open'), edge('open', 'login'),
   edge('check1', 'easy'), edge('easy', 'ea', 'yes'), edge('easy', 'nav', 'no'), edge('nav', 'check2'), edge('check2', 'fill'),
-  edge('ea', 'fill', 'each step'), edge('fill', 'answers'), edge('answers', 'submit'), edge('submit', 'statuses'),
+  edge('ea', 'fill', 'each step'), edge('fill', 'answers'), edge('answers', 'submit', 'manual'), edge('answers', 'autosubmit', 'when enabled'), edge('submit', 'statuses'), edge('autosubmit', 'statuses'),
   edge('open', 'log', undefined, true), edge('answers', 'assist', 'instruct', true),
   edge('nav', 'start', 'company portal'), edge('start', 'account'), edge('account', 'captcha', 'if shown', true), edge('account', 'pages'),
   edge('pages', 'answers', 'missing answers / Review'), edge('structure', 'fill', undefined, true), edge('structure', 'pages', undefined, true),
 ];
 
-type CanvasProps = { model: string; height: number | string; onPromptClick?: (key: string) => void; fullscreen?: boolean; resumeOn?: boolean; onToggleResume?: () => void };
+type CanvasProps = { model: string; height: number | string; onPromptClick?: (key: string) => void; fullscreen?: boolean; resumeOn?: boolean; autoSubmitOn?: boolean; onToggleResume?: () => void; onToggleAutoSubmit?: () => void };
 
-function Canvas({ model, height, onPromptClick, fullscreen, resumeOn = false, onToggleResume }: CanvasProps) {
-  const [nodes, setNodes, onNodesChange] = useNodesState(buildNodes(model, resumeOn));
+function Canvas({ model, height, onPromptClick, fullscreen, resumeOn = false, autoSubmitOn = false, onToggleResume, onToggleAutoSubmit }: CanvasProps) {
+  const [nodes, setNodes, onNodesChange] = useNodesState(buildNodes(model, resumeOn, autoSubmitOn));
   const [edges, , onEdgesChange] = useEdgesState([...EDGES, ...RESUME_EDGES]);
   // Keep dragged positions; only refresh the text / look of nodes that depend on the model or the toggle.
   useEffect(() => {
-    const fresh = new Map(buildNodes(model, resumeOn).map(n => [n.id, n]));
-    setNodes(current => current.map(n => (n.id === 'score' || n.id === 'rtoggle' || RESUME_NODES.has(n.id)) && fresh.get(n.id)
+    const fresh = new Map(buildNodes(model, resumeOn, autoSubmitOn).map(n => [n.id, n]));
+    setNodes(current => current.map(n => (n.id === 'score' || n.id === 'rtoggle' || n.id === 'autosubmit' || RESUME_NODES.has(n.id)) && fresh.get(n.id)
       ? { ...n, data: fresh.get(n.id)!.data, style: fresh.get(n.id)!.style } : n));
-  }, [model, resumeOn, setNodes]);
+  }, [model, resumeOn, autoSubmitOn, setNodes]);
   return (
     <div style={{ height }} className="relative bg-[radial-gradient(circle_at_1px_1px,rgba(245,106,34,0.10)_1px,transparent_0)] bg-[length:24px_24px]">
       <ReactFlow nodes={nodes} edges={edges} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} fitView fitViewOptions={{ padding: 0.12 }}
         nodesConnectable={false} proOptions={{ hideAttribution: true }} minZoom={0.3} maxZoom={1.8}
         onNodeClick={(_, n) => {
-          const data = n.data as { promptKey?: string; toggle?: boolean };
-          if (data.toggle) { onToggleResume?.(); return; }
+          const data = n.data as { promptKey?: string; toggle?: 'resume' | 'auto_submit' };
+          if (data.toggle === 'resume') { onToggleResume?.(); return; }
+          if (data.toggle === 'auto_submit') { onToggleAutoSubmit?.(); return; }
           if (data.promptKey && onPromptClick) onPromptClick(data.promptKey);
         }}>
         <Background color="#E6B98B" gap={18} size={1} />
         <Controls showInteractive={false} />
         {fullscreen && <MiniMap pannable zoomable nodeColor={n => (n.style?.background as string) ?? '#FFF9F0'} />}
       </ReactFlow>
-      <button type="button" onClick={() => setNodes(buildNodes(model, resumeOn))} className="absolute right-3 top-3 z-10 inline-flex items-center gap-1 rounded-full bg-white/90 px-3 py-1.5 text-xs font-bold text-[#82512D] shadow-sm hover:bg-white">
+      <button type="button" onClick={() => setNodes(buildNodes(model, resumeOn, autoSubmitOn))} className="absolute right-3 top-3 z-10 inline-flex items-center gap-1 rounded-full bg-white/90 px-3 py-1.5 text-xs font-bold text-[#82512D] shadow-sm hover:bg-white">
         <RotateCcw size={13} /> Reset layout
       </button>
     </div>
@@ -127,7 +131,7 @@ function Canvas({ model, height, onPromptClick, fullscreen, resumeOn = false, on
 }
 
 /** Full job-search + apply pipeline. Nodes are draggable; purple nodes open their prompt editor. */
-export function PipelineDiagram({ model, onPromptClick, resumeOn = false, onToggleResume }: { model: string; onPromptClick?: (key: string) => void; resumeOn?: boolean; onToggleResume?: () => void }) {
+export function PipelineDiagram({ model, onPromptClick, resumeOn = false, autoSubmitOn = false, onToggleResume, onToggleAutoSubmit }: { model: string; onPromptClick?: (key: string) => void; resumeOn?: boolean; autoSubmitOn?: boolean; onToggleResume?: () => void; onToggleAutoSubmit?: () => void }) {
   const [open, setOpen] = useState(false);
   useEffect(() => {
     if (!open) return;
@@ -138,7 +142,7 @@ export function PipelineDiagram({ model, onPromptClick, resumeOn = false, onTogg
 
   const legend = (
     <div className="flex flex-wrap gap-2 text-[11px] font-bold">
-      {([['find', 'Job search'], ['agent', 'Apply agent'], ['prompt', 'Editable prompt (click)'], ['human', 'You'], ['status', 'Result / log'], [resumeOn ? 'toggleOn' : 'toggleOff', 'Toggle (click)']] as [Tone, string][]).map(([tone, label]) => (
+      {([['find', 'Job search'], ['agent', 'Apply agent'], ['prompt', 'Editable prompt (click)'], ['human', 'You'], ['status', 'Result / log'], [resumeOn ? 'toggleOn' : 'toggleOff', 'Toggle (click)'], [autoSubmitOn ? 'autoOn' : 'autoOff', 'Auto submit']] as [Tone, string][]).map(([tone, label]) => (
         <span key={tone} className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1" style={{ background: TONES[tone].bg, border: `1px solid ${TONES[tone].border}`, color: '#542914' }}>{label}</span>
       ))}
     </div>
@@ -154,7 +158,7 @@ export function PipelineDiagram({ model, onPromptClick, resumeOn = false, onTogg
             <Maximize2 size={13} /> See full workflow
           </button>
         </div>
-        <Canvas model={model} height={520} onPromptClick={onPromptClick} resumeOn={resumeOn} onToggleResume={onToggleResume} />
+        <Canvas model={model} height={520} onPromptClick={onPromptClick} resumeOn={resumeOn} autoSubmitOn={autoSubmitOn} onToggleResume={onToggleResume} onToggleAutoSubmit={onToggleAutoSubmit} />
       </div>
 
       {open && (
@@ -167,7 +171,7 @@ export function PipelineDiagram({ model, onPromptClick, resumeOn = false, onTogg
               <button type="button" onClick={() => setOpen(false)} className="ml-auto rounded-full p-2 text-[#82512D] hover:bg-[#FFE4C8]" aria-label="Close"><X size={18} /></button>
             </div>
             <div className="flex-1">
-              <Canvas model={model} height="100%" fullscreen resumeOn={resumeOn} onToggleResume={onToggleResume} onPromptClick={key => { setOpen(false); onPromptClick?.(key); }} />
+              <Canvas model={model} height="100%" fullscreen resumeOn={resumeOn} autoSubmitOn={autoSubmitOn} onToggleResume={onToggleResume} onToggleAutoSubmit={onToggleAutoSubmit} onPromptClick={key => { setOpen(false); onPromptClick?.(key); }} />
             </div>
           </div>
         </div>

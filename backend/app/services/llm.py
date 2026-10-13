@@ -13,6 +13,40 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+class LLMUnavailableError(RuntimeError):
+    """No configured Gemini model could serve this request."""
+
+
+def _model_candidates(primary: str | None) -> list[str]:
+    return list(dict.fromkeys(
+        name.strip() for name in [primary or settings.ai_model, settings.ai_model, *settings.gemini_fallback_models.split(",")]
+        if name.strip()
+    ))
+
+
+def _client():
+    # The SDK's default retries can leave a workflow blocked for several minutes.
+    # One bounded request per configured model makes failover predictable.
+    # GEMINI_API_KEY is a Vertex AI Express Mode key; route all Gemini calls through Vertex.
+    return genai.Client(vertexai=True, api_key=settings.gemini_api_key, http_options=types.HttpOptions(
+        timeout=settings.gemini_request_timeout_ms,
+        retry_options=types.HttpRetryOptions(attempts=1),
+    ))
+
+
+def _can_fail_over(exc: Exception) -> bool:
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        code = None
+    return code in {404, 429, 500, 502, 503, 504} or isinstance(exc, (TimeoutError, OSError))
+
+
+def _unavailable(last_error: Exception, operation: str) -> LLMUnavailableError:
+    return LLMUnavailableError(f"Gemini is unavailable for {operation}; the workflow kept its saved progress.")
+
+
 @dataclass(frozen=True)
 class LLMJsonResult:
     data: list[dict]
@@ -55,42 +89,43 @@ current_meter: ContextVar[TokenMeter | None] = ContextVar("current_meter", defau
 def generate_text(prompt: str, system_instruction: str) -> str:
     if not settings.gemini_api_key:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="LLM is not configured. Set GEMINI_API_KEY on the backend.")
-    try:
-        client = genai.Client(api_key=settings.gemini_api_key)
-        response = client.models.generate_content(model=settings.ai_model, contents=prompt, config=types.GenerateContentConfig(system_instruction=system_instruction, temperature=0.2))
-        if not response.text:
-            raise ValueError("Gemini returned no text")
-        return response.text
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("Gemini text generation failed for model %s", settings.ai_model)
-        detail = "The configured AI model is unavailable. Update AI_MODEL and restart the backend." if getattr(exc, "code", None) == 404 else "The LLM could not complete this request"
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
+    client = _client()
+    last_error = None
+    for model_name in _model_candidates(settings.ai_model):
+        try:
+            response = client.models.generate_content(model=model_name, contents=prompt, config=types.GenerateContentConfig(system_instruction=system_instruction, temperature=0.2))
+            if not response.text:
+                raise ValueError("Gemini returned no text")
+            return response.text
+        except Exception as exc:
+            if not _can_fail_over(exc):
+                logger.exception("Gemini text generation failed for model %s", model_name)
+                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="The LLM could not complete this request") from exc
+            last_error = exc
+            logger.warning("Gemini model %s unavailable during text generation; moving to the next configured model", model_name)
+    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="AI models are temporarily unavailable. Your saved workflow data is unchanged.") from last_error
 
 
 def generate_json(prompt: str, system_instruction: str, schema: dict, model: str | None = None) -> LLMJsonResult:
     if not settings.gemini_api_key:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="LLM is not configured. Set GEMINI_API_KEY on the backend.")
-    try:
-        client = genai.Client(api_key=settings.gemini_api_key)
-        response = client.models.generate_content(model=model or settings.ai_model, contents=prompt, config=types.GenerateContentConfig(system_instruction=system_instruction, response_mime_type="application/json", response_schema=schema, temperature=0.1))
-        data = json.loads(response.text or "[]")
-        if not isinstance(data, list):
-            raise ValueError("Gemini returned a non-list JSON response")
-        usage = response.usage_metadata
-        return LLMJsonResult(
-            data=data,
-            input_tokens=int(getattr(usage, "prompt_token_count", 0) or 0),
-            output_tokens=int(getattr(usage, "candidates_token_count", 0) or 0),
-            total_tokens=int(getattr(usage, "total_token_count", 0) or 0),
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("Gemini job scoring failed for model %s", model or settings.ai_model)
-        detail = "The configured AI model is unavailable. Update the scoring model in the workflow settings." if getattr(exc, "code", None) == 404 else "The LLM could not score the jobs"
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
+    client = _client()
+    last_error = None
+    for model_name in _model_candidates(model):
+        try:
+            response = client.models.generate_content(model=model_name, contents=prompt, config=types.GenerateContentConfig(system_instruction=system_instruction, response_mime_type="application/json", response_schema=schema, temperature=0.1))
+            data = json.loads(response.text or "[]")
+            if not isinstance(data, list):
+                raise ValueError("Gemini returned a non-list JSON response")
+            usage = response.usage_metadata
+            return LLMJsonResult(data=data, input_tokens=int(getattr(usage, "prompt_token_count", 0) or 0), output_tokens=int(getattr(usage, "candidates_token_count", 0) or 0), total_tokens=int(getattr(usage, "total_token_count", 0) or 0))
+        except Exception as exc:
+            if not _can_fail_over(exc):
+                logger.exception("Gemini job scoring failed for model %s", model_name)
+                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="The LLM could not score the jobs") from exc
+            last_error = exc
+            logger.warning("Gemini model %s unavailable during job scoring; moving to the next configured model", model_name)
+    raise _unavailable(last_error, "job scoring") from last_error
 
 
 async def generate_json_object(prompt: str, model: str | None = None) -> dict:
@@ -100,16 +135,25 @@ async def generate_json_object(prompt: str, model: str | None = None) -> dict:
     """
     if not settings.gemini_api_key:
         raise RuntimeError("LLM is not configured. Set GEMINI_API_KEY on the backend.")
-    client = genai.Client(api_key=settings.gemini_api_key)
-    response = await client.aio.models.generate_content(
-        model=model or settings.ai_model,
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=0, response_mime_type="application/json"),
-    )
-    meter = current_meter.get()
-    if meter is not None:
-        meter.add(response.usage_metadata)
-    return parse_json_object(response.text or "")
+    client = _client()
+    last_error = None
+    for model_name in _model_candidates(model):
+        try:
+            response = await client.aio.models.generate_content(
+                model=model_name, contents=prompt,
+                config=types.GenerateContentConfig(temperature=0, response_mime_type="application/json"),
+            )
+            result = parse_json_object(response.text or "")
+            meter = current_meter.get()
+            if meter is not None:
+                meter.add(response.usage_metadata)
+            return result
+        except Exception as exc:
+            if not _can_fail_over(exc):
+                raise
+            last_error = exc
+            logger.warning("Gemini model %s unavailable during structured generation; moving to the next configured model", model_name)
+    raise _unavailable(last_error, "structured generation") from last_error
 
 
 def parse_json_object(text: str) -> dict:

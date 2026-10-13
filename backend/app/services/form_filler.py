@@ -465,6 +465,36 @@ async def _click(locator, timeout: int = 5000) -> None:
             await locator.evaluate("el => el.click()")
 
 
+async def _fill_text(locator, value: str, timeout: int = 15000) -> None:
+    """Fill a text control, with a fallback for sluggish controlled form widgets."""
+    try:
+        await locator.fill(value, timeout=timeout)
+        return
+    except Exception as fill_error:
+        # Some ATS controls remain editable but never become actionable to Playwright.
+        # Set the native value and dispatch the events framework-controlled forms listen for.
+        try:
+            result = await asyncio.wait_for(locator.evaluate(
+                """(el, value) => {
+                  if (!el.isConnected || el.disabled || el.readOnly) return false;
+                  const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                  const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                  if (!setter) return false;
+                  el.focus();
+                  setter.call(el, value);
+                  el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+                  el.dispatchEvent(new Event('change', { bubbles: true }));
+                  return el.value === value;
+                }""",
+                value,
+            ), timeout=3)
+            if result:
+                return
+        except Exception:
+            pass
+        raise fill_error
+
+
 async def resolve_values(fields: list[dict], user: User, job, notes: list[str] | None = None, *, recheck_all: bool = False,
                          protect: set[str] | None = None) -> tuple[dict[str, str], str]:
     """`protect`: keys the applicant set themselves on this step — never overwritten (not even by the fixed rules below)."""
@@ -693,7 +723,7 @@ async def set_field_value(frame, field: dict, value: str) -> None:
     if field.get("prompt"):
         # Workday multiselect prompt: type, Enter to search, pick the matching option.
         await _click(locator)
-        await locator.fill("")
+        await _fill_text(locator, "")
         await locator.press_sequentially(value, delay=40)
         await locator.press("Enter")
         await frame.wait_for_timeout(1500)
@@ -748,7 +778,7 @@ async def set_field_value(frame, field: dict, value: str) -> None:
         r"country(?:\s+code)?|dial(?:ing)?\s+code", field.get("label") or "", re.I
     ):
         await locator.click(timeout=5000)
-        await locator.fill("")
+        await _fill_text(locator, "")
         await locator.press_sequentially(value, delay=60)
         await frame.wait_for_timeout(1200)
         options = frame.locator(OPTION_SELECTOR)
@@ -760,7 +790,7 @@ async def set_field_value(frame, field: dict, value: str) -> None:
         await locator.press("ArrowDown")
         await locator.press("Enter")
         return
-    await locator.fill(value, timeout=5000)
+    await _fill_text(locator, value)
 
 
 async def fill_fields(frame, fields: list[dict], values: dict[str, str]) -> tuple[list[str], dict[str, str]]:

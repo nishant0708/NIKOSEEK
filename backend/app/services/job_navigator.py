@@ -23,6 +23,7 @@ from app.services.browser_common import human_check_pending
 from app.services.form_filler import FIELD_LOCATOR, diagnose_page, find_root_in_page
 from app.services.linkedin_browser import has_session_cookie, is_auth_url, page_looks_logged_out
 from app.services.llm import generate_json_object
+from app.services.llm import LLMUnavailableError
 from app.services.prompts import render
 from app.services.workday_portal_navigator import (
     _auth_kind as _auth_kind_safe,
@@ -452,6 +453,8 @@ async def _navigate(context, page, job: ScrapedJob, user: User | None, log: Log,
         else:
             try:
                 decision = await generate_json_object(_navigation_prompt(user, job, snap, elements, history))
+            except LLMUnavailableError:
+                raise
             except Exception as exc:
                 # One malformed / failed AI reply must not kill the run: note it and look at the page again.
                 llm_failures += 1

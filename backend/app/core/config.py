@@ -14,7 +14,16 @@ class Settings(BaseSettings):
     supabase_storage_bucket: str = "job-files"
     gemini_api_key: str | None = None
     ai_model: str = "gemini-3.5-flash-lite"
+    gemini_fallback_models: str = "gemini-3.5-flash,gemini-3.5-flash-lite,gemini-3.5-pro"
+    gemini_request_timeout_ms: int = 30000
     cors_origins: str = "http://localhost:5173"
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_username: str | None = None
+    smtp_password: str | None = None
+    smtp_from_email: str | None = None
+    smtp_receipt_email: str | None = None
+    smtp_use_tls: bool = True
 
     @property
     def cors_origin_list(self) -> list[str]:

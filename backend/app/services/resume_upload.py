@@ -15,7 +15,7 @@ import logging
 import re
 from pathlib import Path
 
-from app.services.form_filler import is_resume_choice, resolve_root, set_field_value, upload_resume
+from app.services.form_filler import RESUME_FILE_OPTION, collect_fields, is_resume_choice, resolve_root, set_field_value, upload_resume
 from app.services.resume_store import forget_portal_upload, portal_display_name, record_portal_upload, upload_name_for
 
 logger = logging.getLogger(__name__)
@@ -89,5 +89,26 @@ async def attach_resume(frame, fields: list[dict], *, mode: str, resume_key: str
 
     uploaded = await upload_resume(frame, resume_key, username, root, user_id=user_id, replace=replace)
     if uploaded and portal:
-        await asyncio.to_thread(record_portal_upload, user_id, resume_key, portal, uploaded, uploaded=True)
+        # Some boards display a normalized/stored name that differs from the local filename.
+        # Capture the visible choice when available, scoped to this specific board.
+        display_name = uploaded
+        if choice:
+            try:
+                refreshed = await collect_fields(frame, root)
+                refreshed_choice = next((field for field in refreshed if is_resume_choice(field)), None)
+                if refreshed_choice:
+                    options = refreshed_choice.get("options") or []
+                    matched = match_resume_option(options, uploaded)
+                    if matched:
+                        display_name = matched
+                    else:
+                        previous = {str(option).strip().lower() for option in (choice.get("options") or [])}
+                        added = [str(option).strip() for option in options
+                                 if str(option).strip().lower() not in previous and RESUME_FILE_OPTION.search(str(option))]
+                        if len(added) == 1:
+                            display_name = added[0]
+            except Exception:
+                logger.debug("Could not read the board's displayed resume name after upload", exc_info=True)
+        await asyncio.to_thread(record_portal_upload, user_id, resume_key, portal, display_name, uploaded=True)
+        uploaded = display_name
     return (uploaded, "uploaded") if uploaded else (None, None)
