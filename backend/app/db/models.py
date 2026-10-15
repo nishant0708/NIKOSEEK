@@ -54,6 +54,8 @@ class ScrapedJob(Base):
     location: Mapped[str | None] = mapped_column(String(500), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     date_posted: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Lets the queue and Jobs screen distinguish a manual search from the ambient scheduler.
+    fetched_by_cron: Mapped[bool] = mapped_column(default=False, index=True)
     search_run_id: Mapped[int | None] = mapped_column(ForeignKey("search_runs.id", ondelete="SET NULL"), nullable=True)
     ai_status: Mapped[str] = mapped_column(String(20), default="PENDING", index=True)
     application_status: Mapped[str] = mapped_column(String(40), default="PENDING", index=True)

@@ -27,6 +27,7 @@ import logging
 import smtplib
 from email.message import EmailMessage
 from datetime import UTC, datetime
+from urllib.parse import parse_qs, urlparse
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
@@ -70,6 +71,19 @@ STAGE_NEEDS_INPUT = "Needs your input ({n} field(s))"
 STAGE_READY = "Ready to submit — review and press Submit"
 STAGE_SUBMITTED = "Submitted"
 SUBMITTED = "SUBMITTED"
+
+
+def _indeed_job_key(url: str) -> str | None:
+    """Indeed's stable posting identity survives its verification query params."""
+    try:
+        return parse_qs(urlparse(url).query).get("jk", [None])[0]
+    except Exception:
+        return None
+
+
+def _on_expected_indeed_job(url: str, job_url: str) -> bool:
+    expected = _indeed_job_key(job_url)
+    return bool(expected and _indeed_job_key(url) == expected)
 
 
 async def _send_application_receipt(application: Application, snap: dict) -> None:
@@ -360,6 +374,18 @@ async def _run_pipeline(run: _Run, user: User) -> None:
     await relogin(page)
     if source == LINKEDIN and not page.is_closed() and "/jobs/view/" not in page.url:
         await page.goto(job_url, wait_until="domcontentloaded", timeout=60000)
+    elif source == INDEED and not page.is_closed() and not _on_expected_indeed_job(page.url, job_url):
+        # Indeed often completes Cloudflare/passkey verification on account
+        # settings or home. Let its session settle, then use a fresh tab so the
+        # navigator never asks the LLM to recover from an unrelated page.
+        await run.log("info", "Indeed verification finished away from the posting. Waiting briefly, then reopening this job in a new tab.",
+                      data={"url": page.url, "job_url": job_url}, stage_key="login")
+        await page.wait_for_timeout(75_000)
+        page = await context.new_page()
+        await page.bring_to_front()
+        await page.goto(job_url, wait_until="domcontentloaded", timeout=60_000)
+        log.track(page)
+        await run.log("action", f"Reopened Indeed job in a fresh tab: {page.url}", data={"url": page.url, "job_url": job_url}, stage_key="login")
 
     # 2b. Resume agent (Workflow page toggle): score your resumes against this JD, tailor one if it's worth it.
     #     Runs on the open posting so a missing JD (older LinkedIn searches) can be read from the page.

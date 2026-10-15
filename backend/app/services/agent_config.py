@@ -1,5 +1,6 @@
 from sqlalchemy.orm import Session, object_session
 from sqlalchemy.orm.attributes import flag_modified
+import re
 
 from app.core.config import settings
 from app.core.security import decrypt_secret, encrypt_secret, hash_password
@@ -43,6 +44,55 @@ def get_match_scoring_model(user: User) -> str:
 def set_match_scoring_model(user: User, model: str) -> None:
     config = fresh_config(user)
     config["match_scoring"] = {"model": model.strip()}
+    save_config(user, config)
+
+
+def cron_agent_settings(user: User) -> dict:
+    """Return a defensive, backwards-compatible scheduler configuration."""
+    raw = (user.agent_config or {}).get("cron_agent")
+    saved = dict(raw) if isinstance(raw, dict) else {}
+    sources = [source for source in saved.get("sources", ["linkedin"]) if source in {"linkedin", "indeed"}]
+    def bounded_int(key: str, default: int, low: int, high: int) -> int:
+        try:
+            return min(high, max(low, int(saved.get(key, default))))
+        except (TypeError, ValueError):
+            return default
+    scheduled_time = str(saved.get("scheduled_time", "09:00"))
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", scheduled_time):
+        scheduled_time = "09:00"
+    return {
+        "enabled": bool(saved.get("enabled", False)),
+        "role": str(saved.get("role", ""))[:200],
+        "sources": sources or ["linkedin"],
+        "jobs_per_run": bounded_int("jobs_per_run", 10, 1, 50),
+        "hours_old": bounded_int("hours_old", 24, 1, 720),
+        "interval_hours": bounded_int("interval_hours", 6, 1, 168),
+        "scheduled_time": scheduled_time,
+        "timezone": str(saved.get("timezone", "Asia/Kolkata"))[:100] or "Asia/Kolkata",
+        "location": str(saved.get("location", "India"))[:200] or "India",
+        "indeed_country": str(saved.get("indeed_country", "India"))[:100] or "India",
+        "experience": str(saved.get("experience", "0-1 years"))[:100] or "0-1 years",
+        "last_run_at": saved.get("last_run_at") if isinstance(saved.get("last_run_at"), str) else None,
+        "last_error": saved.get("last_error") if isinstance(saved.get("last_error"), str) else None,
+    }
+
+
+def set_cron_agent_settings(user: User, values: dict) -> dict:
+    config = fresh_config(user)
+    current = cron_agent_settings(user)
+    current.update({key: value for key, value in values.items() if key not in {"last_run_at", "last_error"}})
+    config["cron_agent"] = current
+    save_config(user, config)
+    return current
+
+
+def record_cron_agent_run(user: User, *, ran_at: str, error: str | None) -> None:
+    """Store scheduler metadata without treating it as an editable user setting."""
+    config = fresh_config(user)
+    cron = dict(config.get("cron_agent")) if isinstance(config.get("cron_agent"), dict) else {}
+    cron["last_run_at"] = ran_at
+    cron["last_error"] = error
+    config["cron_agent"] = cron
     save_config(user, config)
 
 

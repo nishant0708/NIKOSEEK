@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -14,6 +16,8 @@ class JobScrapeRequest(BaseModel):
     experience: str = Field(min_length=1, max_length=100)
     min_salary_lpa: int | None = Field(default=None, ge=0, le=1000)
     target_relevant_count: int = Field(default=10, ge=1, le=50)
+    # Internal scheduler marker. The public search form always uses "manual".
+    fetch_mode: Literal["manual", "cron"] = "manual"
 
 
 class JobRead(BaseModel):
@@ -25,6 +29,7 @@ class JobRead(BaseModel):
     location: str | None = None
     description: str | None = None
     date_posted: str | None = None
+    fetched_by_cron: bool = False
     ai_status: str = "PENDING"
     match_score: float | None = None
     ai_reason: str | None = None

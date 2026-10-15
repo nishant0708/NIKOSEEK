@@ -52,6 +52,8 @@ async def startup() -> None:
     Base.metadata.create_all(bind=engine)
     app.state.application_queue = asyncio.Queue()
     app.state.application_worker = asyncio.create_task(application_worker())
+    from app.services.cron_agent import cron_agent_worker
+    app.state.cron_agent_worker = asyncio.create_task(cron_agent_worker(app.state.application_queue))
     logger.info("Backend started with event loop %s; logs are written to backend/logs/backend.log", type(asyncio.get_running_loop()).__name__)
 
 
@@ -60,6 +62,9 @@ async def shutdown() -> None:
     worker = getattr(app.state, "application_worker", None)
     if worker is not None:
         worker.cancel()
+    cron_worker = getattr(app.state, "cron_agent_worker", None)
+    if cron_worker is not None:
+        cron_worker.cancel()
     from app.services.linkedin_browser import linkedin_browser
     from app.services.indeed_browser import indeed_browser
 

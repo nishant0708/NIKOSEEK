@@ -28,7 +28,7 @@ def row_value(row: object, name: str) -> str | None:
 def to_read(job: ScrapedJob) -> JobRead:
     # SQLAlchemy column defaults are applied during INSERT, while this helper
     # also handles new in-memory jobs before that point.
-    return JobRead(id=job.id, source=job.source, external_url=job.external_url, title=job.title, company=job.company, location=job.location, description=job.description, date_posted=job.date_posted, ai_status=job.ai_status or "PENDING", match_score=job.match_score, ai_reason=job.ai_reason, experience_match=job.experience_match, resume_category=job.resume_category)
+    return JobRead(id=job.id, source=job.source, external_url=job.external_url, title=job.title, company=job.company, location=job.location, description=job.description, date_posted=job.date_posted, fetched_by_cron=job.fetched_by_cron, ai_status=job.ai_status or "PENDING", match_score=job.match_score, ai_reason=job.ai_reason, experience_match=job.experience_match, resume_category=job.resume_category)
 
 
 @router.post("/scrape", response_model=JobScrapeResponse)
@@ -101,7 +101,7 @@ def scrape_jobs(payload: JobScrapeRequest, user: CurrentUser, db: DbSession) -> 
         # target. Do not persist them or issue more scoring calls afterward.
         for index, raw in enumerate(scraped if scoring_unavailable else scraped[:len(analyses)], start=1):
             if scoring_unavailable:
-                job = ScrapedJob(user_id=user.id, search_run_id=run.id, **raw)
+                job = ScrapedJob(user_id=user.id, search_run_id=run.id, fetched_by_cron=payload.fetch_mode == "cron", **raw)
                 job.ai_status = "PENDING"
                 job.ai_reason = "Saved without a match score because AI models were unavailable."
                 db.add(job)
@@ -112,7 +112,7 @@ def scrape_jobs(payload: JobScrapeRequest, user: CurrentUser, db: DbSession) -> 
                     db.rollback()
                 continue
             analysis = by_number.get(index, {"accepted": False, "match_score": 0, "reason": "No score returned", "experience_match": "Unknown"})
-            job = ScrapedJob(user_id=user.id, search_run_id=run.id, **raw)
+            job = ScrapedJob(user_id=user.id, search_run_id=run.id, fetched_by_cron=payload.fetch_mode == "cron", **raw)
             candidate = attach_analysis(to_read(job), analysis)
             job.ai_status, job.match_score, job.ai_reason, job.experience_match = candidate.ai_status, candidate.match_score, candidate.ai_reason, candidate.experience_match
             job.resume_category = candidate.resume_category

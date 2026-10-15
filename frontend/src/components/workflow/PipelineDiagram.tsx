@@ -20,7 +20,7 @@ const TONES: Record<Tone, { bg: string; border: string }> = {
 // Nodes that only run while the Resume agent is ON (dimmed when it is off).
 const RESUME_NODES = new Set(['categorize', 'rscore', 'rdecide', 'tailor', 'guard', 'portal']);
 
-function node(id: string, x: number, y: number, title: string, detail: string, tone: Tone, promptKey?: string, dimmed = false, toggleKey?: 'resume' | 'auto_submit'): Node {
+function node(id: string, x: number, y: number, title: string, detail: string, tone: Tone, promptKey?: string, dimmed = false, toggleKey?: 'resume' | 'auto_submit' | 'cron'): Node {
   const t = TONES[tone];
   const toggle = toggleKey;
   return {
@@ -47,12 +47,13 @@ function resumeNodes(on: boolean): Node[] {
   ];
 }
 
-function buildNodes(model: string, resumeOn = false, autoSubmitOn = false): Node[] {
+function buildNodes(model: string, resumeOn = false, autoSubmitOn = false, cronOn = false, cronRole = ''): Node[] {
   return [
     ...resumeNodes(resumeOn),
+    node('cron', -300, -190, `⏱️ Ambient agent: ${cronOn ? 'ON' : 'OFF'}`, cronOn ? `Every scheduled interval: fetches ${cronRole || 'your role'} jobs, scores them and queues accepted matches. Click to edit.` : 'Click to configure automated search and application.', cronOn ? 'toggleOn' : 'toggleOff', undefined, false, 'cron'),
     node('find', 0, 0, '🔎 Find jobs', 'JobSpy scrapes LinkedIn / Indeed with your search.', 'find'),
     node('score', 300, 0, `🧮 Match scoring`, `${model || 'model'} + shared system prompt score each job 0–100.`, 'find'),
-    node('pick', 600, 0, '✅ Review & Apply selected', 'You pick jobs on the Jobs page. LinkedIn / Indeed must be connected.', 'human'),
+    node('pick', 600, 0, '✅ Queue accepted matches', 'You can pick jobs on the Jobs page; the ambient agent queues its accepted matches automatically. LinkedIn / Indeed must be connected.', 'human'),
     node('open', 600, 170, '🌐 Open posting', 'New tab in your signed-in LinkedIn or Indeed window.', 'agent'),
     node('login', 300, 170, '🔐 LinkedIn / Indeed login check', 'Session expired? Log in in the same window.', 'agent'),
     node('check1', 0, 170, '🧠 Correct-page check', 'AI confirms the tab is THIS job (wrong-tab guard).', 'prompt', 'page_verification'),
@@ -72,7 +73,7 @@ function buildNodes(model: string, resumeOn = false, autoSubmitOn = false): Node
     node('account', 1500, 340, '🔑 Sign up / sign in', 'Your job-portal login (Profile page). First time: creates the account and remembers it (workday: {company: true}); next time signs in.', 'agent'),
     node('captcha', 1500, 170, '🧩 CAPTCHA / email check', 'You solve it in the live view (or click the email link); the agent notices and continues by itself.', 'human'),
     node('pages', 1500, 510, '📄 Page by page', 'Uploads the resume, adds a Work Experience / Education entry per job & degree, fills each page, presses Save and Continue — stops at Review.', 'agent'),
-    node('structure', 1200, 680, '🧠 Profile → structured data', 'Turns profile.md + details.md into name parts, address, phone code and dated jobs/degrees for long forms.', 'prompt', 'profile_structuring'),
+    node('structure', 1200, 850, '🧠 Profile → structured data', 'Turns profile.md + details.md into name parts, address, phone code and dated jobs/degrees for long forms.', 'prompt', 'profile_structuring'),
   ];
 }
 
@@ -90,6 +91,7 @@ const RESUME_EDGES: Edge[] = [
 ];
 
 const EDGES: Edge[] = [
+  edge('cron', 'find', 'scheduled', true),
   edge('find', 'score'), edge('score', 'pick'), edge('pick', 'open'), edge('open', 'login'),
   edge('check1', 'easy'), edge('easy', 'ea', 'yes'), edge('easy', 'nav', 'no'), edge('nav', 'check2'), edge('check2', 'fill'),
   edge('ea', 'fill', 'each step'), edge('fill', 'answers'), edge('answers', 'submit', 'manual'), edge('answers', 'autosubmit', 'when enabled'), edge('submit', 'statuses'), edge('autosubmit', 'statuses'),
@@ -98,32 +100,33 @@ const EDGES: Edge[] = [
   edge('pages', 'answers', 'missing answers / Review'), edge('structure', 'fill', undefined, true), edge('structure', 'pages', undefined, true),
 ];
 
-type CanvasProps = { model: string; height: number | string; onPromptClick?: (key: string) => void; fullscreen?: boolean; resumeOn?: boolean; autoSubmitOn?: boolean; onToggleResume?: () => void; onToggleAutoSubmit?: () => void };
+type CanvasProps = { model: string; height: number | string; onPromptClick?: (key: string) => void; fullscreen?: boolean; resumeOn?: boolean; autoSubmitOn?: boolean; cronOn?: boolean; cronRole?: string; onToggleResume?: () => void; onToggleAutoSubmit?: () => void; onEditCron?: () => void };
 
-function Canvas({ model, height, onPromptClick, fullscreen, resumeOn = false, autoSubmitOn = false, onToggleResume, onToggleAutoSubmit }: CanvasProps) {
-  const [nodes, setNodes, onNodesChange] = useNodesState(buildNodes(model, resumeOn, autoSubmitOn));
+function Canvas({ model, height, onPromptClick, fullscreen, resumeOn = false, autoSubmitOn = false, cronOn = false, cronRole = '', onToggleResume, onToggleAutoSubmit, onEditCron }: CanvasProps) {
+  const [nodes, setNodes, onNodesChange] = useNodesState(buildNodes(model, resumeOn, autoSubmitOn, cronOn, cronRole));
   const [edges, , onEdgesChange] = useEdgesState([...EDGES, ...RESUME_EDGES]);
   // Keep dragged positions; only refresh the text / look of nodes that depend on the model or the toggle.
   useEffect(() => {
-    const fresh = new Map(buildNodes(model, resumeOn, autoSubmitOn).map(n => [n.id, n]));
-    setNodes(current => current.map(n => (n.id === 'score' || n.id === 'rtoggle' || n.id === 'autosubmit' || RESUME_NODES.has(n.id)) && fresh.get(n.id)
+    const fresh = new Map(buildNodes(model, resumeOn, autoSubmitOn, cronOn, cronRole).map(n => [n.id, n]));
+    setNodes(current => current.map(n => (n.id === 'score' || n.id === 'rtoggle' || n.id === 'autosubmit' || n.id === 'cron' || RESUME_NODES.has(n.id)) && fresh.get(n.id)
       ? { ...n, data: fresh.get(n.id)!.data, style: fresh.get(n.id)!.style } : n));
-  }, [model, resumeOn, autoSubmitOn, setNodes]);
+  }, [model, resumeOn, autoSubmitOn, cronOn, cronRole, setNodes]);
   return (
     <div style={{ height }} className="relative bg-[radial-gradient(circle_at_1px_1px,rgba(245,106,34,0.10)_1px,transparent_0)] bg-[length:24px_24px]">
       <ReactFlow nodes={nodes} edges={edges} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} fitView fitViewOptions={{ padding: 0.12 }}
         nodesConnectable={false} proOptions={{ hideAttribution: true }} minZoom={0.3} maxZoom={1.8}
         onNodeClick={(_, n) => {
-          const data = n.data as { promptKey?: string; toggle?: 'resume' | 'auto_submit' };
+          const data = n.data as { promptKey?: string; toggle?: 'resume' | 'auto_submit' | 'cron' };
           if (data.toggle === 'resume') { onToggleResume?.(); return; }
           if (data.toggle === 'auto_submit') { onToggleAutoSubmit?.(); return; }
+          if (data.toggle === 'cron') { onEditCron?.(); return; }
           if (data.promptKey && onPromptClick) onPromptClick(data.promptKey);
         }}>
         <Background color="#E6B98B" gap={18} size={1} />
         <Controls showInteractive={false} />
         {fullscreen && <MiniMap pannable zoomable nodeColor={n => (n.style?.background as string) ?? '#FFF9F0'} />}
       </ReactFlow>
-      <button type="button" onClick={() => setNodes(buildNodes(model, resumeOn, autoSubmitOn))} className="absolute right-3 top-3 z-10 inline-flex items-center gap-1 rounded-full bg-white/90 px-3 py-1.5 text-xs font-bold text-[#82512D] shadow-sm hover:bg-white">
+      <button type="button" onClick={() => setNodes(buildNodes(model, resumeOn, autoSubmitOn, cronOn, cronRole))} className="absolute right-3 top-3 z-10 inline-flex items-center gap-1 rounded-full bg-white/90 px-3 py-1.5 text-xs font-bold text-[#82512D] shadow-sm hover:bg-white">
         <RotateCcw size={13} /> Reset layout
       </button>
     </div>
@@ -131,7 +134,7 @@ function Canvas({ model, height, onPromptClick, fullscreen, resumeOn = false, au
 }
 
 /** Full job-search + apply pipeline. Nodes are draggable; purple nodes open their prompt editor. */
-export function PipelineDiagram({ model, onPromptClick, resumeOn = false, autoSubmitOn = false, onToggleResume, onToggleAutoSubmit }: { model: string; onPromptClick?: (key: string) => void; resumeOn?: boolean; autoSubmitOn?: boolean; onToggleResume?: () => void; onToggleAutoSubmit?: () => void }) {
+export function PipelineDiagram({ model, onPromptClick, resumeOn = false, autoSubmitOn = false, cronOn = false, cronRole = '', onToggleResume, onToggleAutoSubmit, onEditCron }: { model: string; onPromptClick?: (key: string) => void; resumeOn?: boolean; autoSubmitOn?: boolean; cronOn?: boolean; cronRole?: string; onToggleResume?: () => void; onToggleAutoSubmit?: () => void; onEditCron?: () => void }) {
   const [open, setOpen] = useState(false);
   useEffect(() => {
     if (!open) return;
@@ -158,7 +161,7 @@ export function PipelineDiagram({ model, onPromptClick, resumeOn = false, autoSu
             <Maximize2 size={13} /> See full workflow
           </button>
         </div>
-        <Canvas model={model} height={520} onPromptClick={onPromptClick} resumeOn={resumeOn} autoSubmitOn={autoSubmitOn} onToggleResume={onToggleResume} onToggleAutoSubmit={onToggleAutoSubmit} />
+        <Canvas model={model} height={680} onPromptClick={onPromptClick} resumeOn={resumeOn} autoSubmitOn={autoSubmitOn} cronOn={cronOn} cronRole={cronRole} onToggleResume={onToggleResume} onToggleAutoSubmit={onToggleAutoSubmit} onEditCron={onEditCron} />
       </div>
 
       {open && (
@@ -171,7 +174,7 @@ export function PipelineDiagram({ model, onPromptClick, resumeOn = false, autoSu
               <button type="button" onClick={() => setOpen(false)} className="ml-auto rounded-full p-2 text-[#82512D] hover:bg-[#FFE4C8]" aria-label="Close"><X size={18} /></button>
             </div>
             <div className="flex-1">
-              <Canvas model={model} height="100%" fullscreen resumeOn={resumeOn} autoSubmitOn={autoSubmitOn} onToggleResume={onToggleResume} onToggleAutoSubmit={onToggleAutoSubmit} onPromptClick={key => { setOpen(false); onPromptClick?.(key); }} />
+              <Canvas model={model} height="100%" fullscreen resumeOn={resumeOn} autoSubmitOn={autoSubmitOn} cronOn={cronOn} cronRole={cronRole} onToggleResume={onToggleResume} onToggleAutoSubmit={onToggleAutoSubmit} onEditCron={() => { setOpen(false); onEditCron?.(); }} onPromptClick={key => { setOpen(false); onPromptClick?.(key); }} />
             </div>
           </div>
         </div>

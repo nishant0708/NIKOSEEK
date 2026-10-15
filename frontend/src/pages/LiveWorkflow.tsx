@@ -482,7 +482,10 @@ export function LiveWorkflow({ token }: { token: string }) {
     if (!application.job_id) return;
     setBusy(true);
     try {
-      await api.applyJobs(token, { job_ids: [application.job_id], resume_key: application.resume_key });
+      // Passing an automatically chosen resume back as `resume_key` pins it and
+      // prevents the resume agent from evaluating it again. Only preserve a
+      // resume that the applicant explicitly pinned themselves.
+      await api.applyJobs(token, { job_ids: [application.job_id], resume_key: application.resume_agent?.pinned ? application.resume_key : undefined });
     } catch (e) {
       showToast(`⚠️ ${e instanceof Error ? e.message : 'Could not retry this job.'}`);
     } finally {

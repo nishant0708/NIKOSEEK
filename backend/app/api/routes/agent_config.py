@@ -1,9 +1,9 @@
 from fastapi import APIRouter, HTTPException, status
 
 from app.api.deps import CurrentAdmin, CurrentUser, DbSession
-from app.schemas.agent_config import AgentConfigRead, AgentConfigUpdate, AgentPromptUpdate, AutoSubmitSettings, SystemPromptUpdate
+from app.schemas.agent_config import AgentConfigRead, AgentConfigUpdate, AgentPromptUpdate, AutoSubmitSettings, CronAgentSettings, SystemPromptUpdate
 from app.services.agent_config import (
-    get_match_scoring_model, get_match_scoring_prompt, save_match_scoring_prompt, set_match_scoring_model,
+    cron_agent_settings, get_match_scoring_model, get_match_scoring_prompt, save_match_scoring_prompt, set_cron_agent_settings, set_match_scoring_model,
 )
 
 router = APIRouter(prefix="/agent-config", tags=["agent configuration"])
@@ -82,6 +82,23 @@ def update_auto_submit(payload: AutoSubmitSettings, user: CurrentUser, db: DbSes
     save_config(user, config)
     db.commit()
     return AutoSubmitSettings(enabled=payload.enabled)
+
+
+@router.get("/cron-agent", response_model=CronAgentSettings)
+def get_cron_agent(user: CurrentUser) -> CronAgentSettings:
+    return CronAgentSettings(**cron_agent_settings(user))
+
+
+@router.put("/cron-agent", response_model=CronAgentSettings)
+def update_cron_agent(payload: CronAgentSettings, user: CurrentUser, db: DbSession) -> CronAgentSettings:
+    invalid = set(payload.sources) - {"linkedin", "indeed"}
+    if invalid or not payload.sources:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Choose LinkedIn, Indeed, or both.")
+    if payload.enabled and not payload.role.strip():
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Add the role the scheduled agent should search for.")
+    saved = set_cron_agent_settings(user, payload.model_dump())
+    db.commit()
+    return CronAgentSettings(**saved)
 
 
 @router.get("/resume-agent", response_model=ResumeAgentSettings)

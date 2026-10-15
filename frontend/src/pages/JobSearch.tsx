@@ -37,6 +37,7 @@ function Card({ job, selected, selectable, onToggle, onScore, scoring }: { job: 
             </div>
             <div className="flex min-w-0 flex-wrap items-center gap-1.5">
               <span className="rounded-full bg-[#FFF0DE] px-2 py-1 text-[10px] font-black uppercase tracking-[.1em] text-[#92502A]">{job.source}</span>
+              {job.fetched_by_cron && <span title="Fetched by the scheduled agent" className="rounded-full bg-[#F0E7FF] px-2 py-1 text-[10px] font-black uppercase tracking-[.1em] text-[#7541AE]">Cron</span>}
               {job.resume_category && <span title="Resume category (resume agent)" className="rounded-full bg-[#F4ECFF] px-2 py-1 text-[10px] font-black text-[#7A3FB8]">{job.resume_category}</span>}
               <b className={`rounded-full px-2 py-1 text-[10px] ${job.ai_status === 'ACCEPTED' ? 'bg-[#DDF4D5] text-[#347233]' : job.ai_status === 'PENDING' ? 'bg-[#FFF0BD] text-[#805940]' : 'bg-[#FFE1D6] text-[#AD3212]'}`}>
                 {job.ai_status === 'PENDING' ? 'Pending score' : `${job.match_score?.toFixed(0) ?? 0}% match`}

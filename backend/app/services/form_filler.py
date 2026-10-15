@@ -36,7 +36,7 @@ FIELD_KEY_PATTERNS: list[tuple[tuple[str, ...], str]] = [
     (("last name", "lastname", "family-name", "surname", "family_name"), "last_name"),
     (("full name", "your name", "legal name"), "full_name"),
     (("email", "e-mail"), "email"),
-    (("notice period", "notice-period", "availability", "available to join"), "notice_period"),
+    (("notice period", "notice-period", "notice", "availability", "available to join", "available to start", "when can you join", "when can you start"), "notice_period"),
     (("phone", "mobile", "tel"), "phone"),
     (("city",), "city"),
     (("country",), "country"),
@@ -300,7 +300,7 @@ def profile_answers(username: str) -> dict[str, str]:
 def profile_answers_from_text(text: str) -> dict[str, str]:
     """Explicit notice period ("notice period: 30 days", "can join in 2 weeks", "immediate joiner" -> 0) in days."""
     notice = re.search(
-        r"(?:notice\s*period|available\s*to\s*join|availability|join\s*(?:in|within|after))[^\n]*?"
+        r"(?:notice(?:\s*period)?|available\s*to\s*(?:join|start)|availability|when\s*(?:can|would).*?(?:join|start)|join\s*(?:in|within|after))[^\n]*?"
         r"(\d+(?:\.\d+)?)\s*(days?|weeks?|months?)",
         text,
         re.I,
@@ -508,7 +508,7 @@ async def resolve_values(fields: list[dict], user: User, job, notes: list[str] |
         if told:
             answers["notice_period"] = told
     for field in fields:
-        if re.search(r"notice\s*period|available\s*to\s*join|availability", field.get("label", ""), re.I):
+        if re.search(r"\bnotice\b|available\s*to\s*(?:join|start)|availability|when\s*(?:can|would).*?(?:join|start)", field.get("label", ""), re.I):
             days = answers.get("notice_period")
             if field.get("options"):
                 # Dropdown / radio: pick the option for the stated number of days, else leave it for the applicant.
@@ -793,6 +793,37 @@ async def set_field_value(frame, field: dict, value: str) -> None:
     await _fill_text(locator, value)
 
 
+async def _field_value_was_applied(frame, field: dict, value: str) -> bool:
+    """A slow custom picker can time out *after* it has committed the value.
+
+    Do not report that as a failed fill and leave an otherwise complete form in
+    review. We require either the requested option or a value changed from the
+    pre-fill snapshot, never merely any pre-existing value.
+    """
+    try:
+        key, kind, previous = field["key"], field.get("kind"), str(field.get("value") or "").strip()
+        if kind == "radio":
+            option = _match_option(field.get("options") or [], value)
+            if option is None:
+                return False
+            index = field["options"].index(option)
+            return await frame.locator(f'[data-fill-key="{key}"][data-fill-option="{index}"]').first.is_checked()
+        locator = frame.locator(f'[data-fill-key="{key}"]').first
+        if kind == "checkbox":
+            return await locator.is_checked() == (value.strip().lower() in ("yes", "true", "1", "checked", "y"))
+        if kind == "select":
+            current = (await locator.locator("option:checked").inner_text()).strip()
+        elif kind == "listbox":
+            current = (await locator.inner_text()).strip()
+        else:
+            current = (await locator.input_value()).strip()
+        if not current or re.match(r"^(select one|select|choose|--)$", current, re.I):
+            return False
+        return current != previous and bool(_match_option([current], value) or current.casefold() == value.strip().casefold())
+    except Exception:
+        return False
+
+
 async def fill_fields(frame, fields: list[dict], values: dict[str, str]) -> tuple[list[str], dict[str, str]]:
     """Fill many fields. Returns (filled keys, {key: error})."""
     by_key = {f["key"]: f for f in fields}
@@ -806,6 +837,14 @@ async def fill_fields(frame, fields: list[dict], values: dict[str, str]) -> tupl
             await set_field_value(frame, field, str(value))
             filled.append(key)
         except Exception as exc:
+            # Some searchable/listbox controls commit their selection then keep
+            # animating, causing Playwright's click/fill promise to time out.
+            # Read the real control before treating that as an application error.
+            await frame.wait_for_timeout(500)
+            if await _field_value_was_applied(frame, field, str(value)):
+                logger.info("Field %s (%s) was filled despite a delayed control response", key, field.get("label"))
+                filled.append(key)
+                continue
             logger.warning("Could not fill field %s (%s): %s", key, field.get("label"), exc)
             errors[key] = str(exc).splitlines()[0][:200]
     return filled, errors
@@ -869,6 +908,10 @@ async def upload_resume(frame, resume_key: str | None, username: str, root: str 
 def remember_answers(username: str, answers: list[tuple[str, str]]) -> None:
     """Append answers the user typed to details.md so the AI can reuse them next time (like apply.js)."""
     answers = [(label.strip(), value.strip()) for label, value in answers if label and label.strip() and value and value.strip()]
+    # Sites phrase this dozens of ways. Save one canonical line as well, so
+    # later forms can always recognize a notice-period answer.
+    answers = [("Notice period", value) if re.search(r"\bnotice\b|available\s*to\s*(?:join|start)|when\s*(?:can|would).*?(?:join|start)", label, re.I) else (label, value)
+               for label, value in answers]
     if not answers:
         return
     details = read_details_markdown(username) or ""

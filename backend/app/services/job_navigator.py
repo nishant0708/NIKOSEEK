@@ -17,6 +17,7 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
+from urllib.parse import parse_qs, urlparse
 
 from app.db.models import ScrapedJob, User
 from app.services.browser_common import human_check_pending
@@ -104,6 +105,18 @@ def _on_linkedin(page) -> bool:
 
 def _on_job_posting(page) -> bool:
     return bool(JOB_ID_PATTERN.search(page.url or "") or CURRENT_JOB_ID_PATTERN.search(page.url or ""))
+
+
+def _indeed_job_key(url: str) -> str | None:
+    try:
+        return parse_qs(urlparse(url).query).get("jk", [None])[0]
+    except Exception:
+        return None
+
+
+def _on_expected_indeed_job(page, start_url: str) -> bool:
+    expected = _indeed_job_key(start_url)
+    return bool(expected and _indeed_job_key(page.url or "") == expected)
 
 
 async def find_form_frame(page):
@@ -362,6 +375,14 @@ async def _navigate(context, page, job: ScrapedJob, user: User | None, log: Log,
             await log("info", f"Landed on {page.url} instead of the job posting — reopening the job.", data={"url": page.url, "job_url": start_url})
             await page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(2000)
+
+        # Indeed verification sometimes returns to home/settings instead of the
+        # job. Reopen the exact `jk` posting before the LLM sees that page.
+        if "indeed.com" in (page.url or "") and not _on_indeed_apply(page) and not _on_expected_indeed_job(page, start_url) and reopened < 2 and pending_click is None:
+            reopened += 1
+            await log("info", f"Indeed returned to {page.url} instead of this job — reopening the posting.", data={"url": page.url, "job_url": start_url})
+            await page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(3000)
 
         # 2b) Company portal (Workday, iCIMS, ...): start screens, then sign up / sign in with your job-portal login.
         if not _on_job_board(page) and user is not None:
