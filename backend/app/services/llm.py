@@ -1,6 +1,9 @@
 """Small Gemini gateway shared by profile generation and job matching."""
 import json
 import logging
+import asyncio
+import httpx
+import urllib.request
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
@@ -14,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class LLMUnavailableError(RuntimeError):
-    """No configured Gemini model could serve this request."""
+    """No configured LLM provider could serve this request."""
 
 
 def _model_candidates(primary: str | None) -> list[str]:
@@ -34,18 +37,57 @@ def _client():
     ))
 
 
-def _can_fail_over(exc: Exception) -> bool:
-    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-    try:
-        code = int(code)
-    except (TypeError, ValueError):
-        code = None
-    return code in {404, 429, 500, 502, 503, 504} or isinstance(exc, (TimeoutError, OSError))
-
-
 def _unavailable(last_error: Exception, operation: str) -> LLMUnavailableError:
-    return LLMUnavailableError(f"Gemini is unavailable for {operation}; the workflow kept its saved progress.")
+    return LLMUnavailableError(f"Configured AI models are unavailable for {operation}; the workflow kept its saved progress.")
 
+
+def _groq_completion(prompt: str, system_instruction: str, *, json_mode: bool = True) -> tuple[str, dict]:
+    if not settings.groq_api_key:
+        raise LLMUnavailableError("Groq is not configured. Set GROQ_API_KEY on the backend.")
+    body = {
+        "model": settings.groq_model,
+        "messages": [
+            {"role": "system", "content": system_instruction or "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+    }
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    endpoint = settings.groq_base_url.rstrip("/")
+    if not endpoint.endswith("/chat/completions"):
+        endpoint = f"{endpoint}/chat/completions"
+    logger.info("Calling Groq fallback model=%s endpoint=%s json_mode=%s", settings.groq_model, endpoint, json_mode)
+    try:
+        resp = httpx.post(
+            endpoint,
+            json=body,
+            headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+            timeout=settings.gemini_request_timeout_ms / 1000,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except httpx.HTTPStatusError as exc:
+        logger.warning(
+            "Groq fallback rejected request: HTTP %s — %s",
+            exc.response.status_code,
+            exc.response.text[:500],
+        )
+        raise LLMUnavailableError(f"Groq request failed with HTTP {exc.response.status_code}.") from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Groq fallback request failed: %s: %r", type(exc).__name__, exc)
+        raise LLMUnavailableError("Groq is unavailable.") from exc
+
+    choices = payload.get("choices") or []
+    content = choices[0].get("message", {}).get("content") if choices else None
+    if not isinstance(content, str) or not content.strip():
+        raise LLMUnavailableError("Groq returned no content.")
+    usage = payload.get("usage") or {}
+    return content, {
+        "input": int(usage.get("prompt_tokens", 0) or 0),
+        "output": int(usage.get("completion_tokens", 0) or 0),
+        "total": int(usage.get("total_tokens", 0) or 0),
+    }
 
 @dataclass(frozen=True)
 class LLMJsonResult:
@@ -87,45 +129,54 @@ current_meter: ContextVar[TokenMeter | None] = ContextVar("current_meter", defau
 
 
 def generate_text(prompt: str, system_instruction: str) -> str:
-    if not settings.gemini_api_key:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="LLM is not configured. Set GEMINI_API_KEY on the backend.")
-    client = _client()
+    client = _client() if settings.gemini_api_key else None
     last_error = None
-    for model_name in _model_candidates(settings.ai_model):
-        try:
-            response = client.models.generate_content(model=model_name, contents=prompt, config=types.GenerateContentConfig(system_instruction=system_instruction, temperature=0.2))
-            if not response.text:
-                raise ValueError("Gemini returned no text")
-            return response.text
-        except Exception as exc:
-            if not _can_fail_over(exc):
-                logger.exception("Gemini text generation failed for model %s", model_name)
-                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="The LLM could not complete this request") from exc
-            last_error = exc
-            logger.warning("Gemini model %s unavailable during text generation; moving to the next configured model", model_name)
-    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="AI models are temporarily unavailable. Your saved workflow data is unchanged.") from last_error
+    if client is not None:
+        for model_name in _model_candidates(settings.ai_model):
+            try:
+                response = client.models.generate_content(model=model_name, contents=prompt, config=types.GenerateContentConfig(system_instruction=system_instruction, temperature=0.2))
+                if not response.text:
+                    raise ValueError("Gemini returned no text")
+                return response.text
+            except Exception as exc:
+                last_error = exc
+                logger.warning("Gemini text generation failed for model %s (%s); moving to the next configured model or Groq", model_name, type(exc).__name__)
+    try:
+        text, _ = _groq_completion(prompt, system_instruction, json_mode=False)
+        logger.info("Groq handled text generation after Gemini fallback")
+        return text
+    except LLMUnavailableError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="AI models are temporarily unavailable. Your saved workflow data is unchanged.") from (last_error or exc)
 
 
 def generate_json(prompt: str, system_instruction: str, schema: dict, model: str | None = None) -> LLMJsonResult:
-    if not settings.gemini_api_key:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="LLM is not configured. Set GEMINI_API_KEY on the backend.")
-    client = _client()
+    client = _client() if settings.gemini_api_key else None
     last_error = None
-    for model_name in _model_candidates(model):
-        try:
-            response = client.models.generate_content(model=model_name, contents=prompt, config=types.GenerateContentConfig(system_instruction=system_instruction, response_mime_type="application/json", response_schema=schema, temperature=0.1))
-            data = json.loads(response.text or "[]")
-            if not isinstance(data, list):
-                raise ValueError("Gemini returned a non-list JSON response")
-            usage = response.usage_metadata
-            return LLMJsonResult(data=data, input_tokens=int(getattr(usage, "prompt_token_count", 0) or 0), output_tokens=int(getattr(usage, "candidates_token_count", 0) or 0), total_tokens=int(getattr(usage, "total_token_count", 0) or 0))
-        except Exception as exc:
-            if not _can_fail_over(exc):
-                logger.exception("Gemini job scoring failed for model %s", model_name)
-                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="The LLM could not score the jobs") from exc
-            last_error = exc
-            logger.warning("Gemini model %s unavailable during job scoring; moving to the next configured model", model_name)
-    raise _unavailable(last_error, "job scoring") from last_error
+    if client is not None:
+        for model_name in _model_candidates(model):
+            try:
+                response = client.models.generate_content(model=model_name, contents=prompt, config=types.GenerateContentConfig(system_instruction=system_instruction, response_mime_type="application/json", response_schema=schema, temperature=0.1))
+                data = json.loads(response.text or "[]")
+                if not isinstance(data, list):
+                    raise ValueError("Gemini returned a non-list JSON response")
+                usage = response.usage_metadata
+                return LLMJsonResult(data=data, input_tokens=int(getattr(usage, "prompt_token_count", 0) or 0), output_tokens=int(getattr(usage, "candidates_token_count", 0) or 0), total_tokens=int(getattr(usage, "total_token_count", 0) or 0))
+            except Exception as exc:
+                last_error = exc
+                logger.warning("Gemini job scoring failed for model %s (%s); moving to the next configured model or Groq", model_name, type(exc).__name__)
+    try:
+        # json_object requires an object at the top level; Gemini's schema for
+        # this call is a list, so give Groq an explicit stable envelope.
+        text, usage = _groq_completion(prompt, system_instruction + "\nReturn the requested list in a JSON object under the key 'jobs'.")
+        data = json.loads(text)
+        if isinstance(data, dict):
+            data = data.get("jobs") or data.get("results") or []
+        if not isinstance(data, list):
+            raise ValueError("Groq returned a non-list JSON response")
+        logger.info("Groq handled job scoring after Gemini fallback")
+        return LLMJsonResult(data=data, input_tokens=usage["input"], output_tokens=usage["output"], total_tokens=usage["total"])
+    except Exception as exc:
+        raise _unavailable(last_error or exc, "job scoring") from (last_error or exc)
 
 
 async def generate_json_object(prompt: str, model: str | None = None) -> dict:
@@ -133,27 +184,36 @@ async def generate_json_object(prompt: str, model: str | None = None) -> dict:
 
     Raises instead of returning HTTP errors because it runs inside the background worker.
     """
-    if not settings.gemini_api_key:
-        raise RuntimeError("LLM is not configured. Set GEMINI_API_KEY on the backend.")
-    client = _client()
+    client = _client() if settings.gemini_api_key else None
     last_error = None
-    for model_name in _model_candidates(model):
-        try:
-            response = await client.aio.models.generate_content(
+    if client is not None:
+        for model_name in _model_candidates(model):
+            try:
+                response = await client.aio.models.generate_content(
                 model=model_name, contents=prompt,
                 config=types.GenerateContentConfig(temperature=0, response_mime_type="application/json"),
-            )
-            result = parse_json_object(response.text or "")
-            meter = current_meter.get()
-            if meter is not None:
-                meter.add(response.usage_metadata)
-            return result
-        except Exception as exc:
-            if not _can_fail_over(exc):
-                raise
-            last_error = exc
-            logger.warning("Gemini model %s unavailable during structured generation; moving to the next configured model", model_name)
-    raise _unavailable(last_error, "structured generation") from last_error
+                )
+                result = parse_json_object(response.text or "")
+                meter = current_meter.get()
+                if meter is not None:
+                    meter.add(response.usage_metadata)
+                return result
+            except Exception as exc:
+                last_error = exc
+                logger.warning("Gemini structured generation failed for model %s (%s); moving to the next configured model or Groq", model_name, type(exc).__name__)
+    try:
+        text, usage = await asyncio.to_thread(_groq_completion, prompt, "", json_mode=True)
+        result = parse_json_object(text)
+        meter = current_meter.get()
+        if meter is not None:
+            meter.input_tokens += usage["input"]
+            meter.output_tokens += usage["output"]
+            meter.total_tokens += usage["total"]
+            meter.calls += 1
+        logger.info("Groq handled structured generation after Gemini fallback")
+        return result
+    except Exception as exc:
+        raise _unavailable(last_error or exc, "structured generation") from (last_error or exc)
 
 
 def parse_json_object(text: str) -> dict:

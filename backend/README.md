@@ -7,8 +7,9 @@ This backend uses **Supabase Postgres** and a **private Supabase Storage bucket*
 3. In Supabase Dashboard > Settings > API, copy the project URL and **service_role** key into `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`. This key is backend-only and must never be placed in frontend code.
 4. Copy `.env.example` to `.env`; set a long, random `JWT_SECRET_KEY`.
 5. Set `GEMINI_API_KEY` to your Vertex AI Express Mode API key. The backend routes Gemini profile generation, job scoring, and application workflows through Vertex AI. Optionally change `AI_MODEL`; the default is `gemini-3.5-flash-lite`.
-6. Run `supabase/migrations/phase_2_matching.sql` in the Supabase SQL editor to add search-run and AI-score fields.
-7. Create a virtual environment, install requirements, and run: `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/python run.py`
+6. Optionally set `GROQ_API_KEY` to enable Groq's free-tier fallback when all configured Gemini models fail. The supplied default is the open-weight `openai/gpt-oss-20b` model; keep all provider keys in the backend environment only.
+7. Run `supabase/migrations/phase_2_matching.sql` in the Supabase SQL editor to add search-run and AI-score fields.
+8. Create a virtual environment, install requirements, and run: `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/python run.py`
 
 Interactive API documentation is at `http://localhost:8000/docs`.
 

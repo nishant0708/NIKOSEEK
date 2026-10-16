@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from app.api.routes.jobs import scrape_jobs
+from app.api.routes.jobs import run_scrape_jobs
 from app.db.models import ScrapedJob, User
 from app.db.session import SessionLocal
 from app.schemas.jobs import JobScrapeRequest
@@ -53,10 +54,15 @@ def _is_due(settings: dict, now: datetime) -> bool:
     return parsed < latest_slot.astimezone(UTC)
 
 
-def run_due_cron_agents() -> list[tuple[int, int]]:
+def _search_terms(role: str) -> list[str]:
+    """Treat comma/newline-separated roles as independent scheduled searches."""
+    return [term.strip() for term in re.split(r"[,;\n]+", role) if term.strip()]
+
+
+def run_due_cron_agents() -> list[tuple[int, int, float]]:
     """Run due configurations in a worker thread and return newly queued apps."""
     db = SessionLocal()
-    queued: list[tuple[int, int]] = []
+    queued: list[tuple[int, int, float]] = []
     try:
         now = datetime.now(UTC)
         users = db.query(User).all()
@@ -65,28 +71,39 @@ def run_due_cron_agents() -> list[tuple[int, int]]:
             if not config["enabled"] or not config["role"].strip() or not _is_due(config, now):
                 continue
             try:
-                scrape_jobs(JobScrapeRequest(
-                    sources=config["sources"], search_term=config["role"], location=config["location"],
-                    country_indeed=config["indeed_country"] if "indeed" in config["sources"] else None,
-                    experience=config["experience"], hours_old=config["hours_old"],
-                    results_wanted=min(100, max(30, config["jobs_per_run"] * 10)),
-                    target_relevant_count=config["jobs_per_run"], fetch_mode="cron",
-                ), user, db)
-                # Include a previous scheduled match that was held because its
-                # provider was disconnected. It should apply on the first run
-                # after the user reconnects, not be stranded as a duplicate.
-                job_ids = [job_id for (job_id,) in db.query(ScrapedJob.id).filter(
+                # Search each role/provider pair separately. This gives each
+                # configured source its own target count and search run.
+                job_ids: list[int] = []
+                for role in _search_terms(config["role"]):
+                    for source in config["sources"]:
+                        result = run_scrape_jobs(JobScrapeRequest(
+                            sources=[source], search_term=role, location=config["location"],
+                            country_indeed=config["indeed_country"] if source == "indeed" else None,
+                            experience=config["experience"], hours_old=config["hours_old"],
+                            results_wanted=min(100, max(30, config["jobs_per_run"] * 10)),
+                            target_relevant_count=config["jobs_per_run"], fetch_mode="cron",
+                        ), user, db)
+                        # Only queue matches discovered by this scheduled run.
+                        # Reusing all historical cron matches caused retries of
+                        # old applications every time the scheduler ran.
+                        job_ids.extend(job.id for job in result.accepted_jobs if job.id is not None)
+                # A match saved while a provider was disconnected has no
+                # application row yet. Retry only those held matches after a
+                # reconnect; never include jobs already queued or processed.
+                held_job_ids = [job_id for (job_id,) in db.query(ScrapedJob.id).filter(
                     ScrapedJob.user_id == user.id,
                     ScrapedJob.fetched_by_cron.is_(True),
                     ScrapedJob.ai_status == "ACCEPTED",
                     ScrapedJob.application_status == "PENDING",
+                    ScrapedJob.application_id.is_(None),
                 ).all()]
+                job_ids = list(dict.fromkeys(job_ids + held_job_ids))
                 connection_error = application_connection_error(db, user, job_ids) if job_ids else None
                 if connection_error:
                     error = f"Fetched matches, but automatic apply is waiting for {connection_error.replace('_', ' ').lower()}."
                 elif job_ids:
                     applications = enqueue_applications(db, user, job_ids, None)
-                    queued.extend((user.id, application.id) for application in applications)
+                    queued.extend((user.id, application.id, 60.0) for application in applications)
                     error = None
                 else:
                     error = None
@@ -107,7 +124,7 @@ def run_due_cron_agents() -> list[tuple[int, int]]:
     return queued
 
 
-async def cron_agent_worker(queue: asyncio.Queue[tuple[int, int]]) -> None:
+async def cron_agent_worker(queue: asyncio.Queue[tuple[int, int, float]]) -> None:
     """Check on a short cadence; each user controls their own longer interval."""
     while True:
         try:

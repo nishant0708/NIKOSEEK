@@ -57,6 +57,14 @@ def cron_agent_settings(user: User) -> dict:
             return min(high, max(low, int(saved.get(key, default))))
         except (TypeError, ValueError):
             return default
+    def posted_age() -> int | None:
+        value = saved.get("hours_old", 24)
+        if value is None or value == "":
+            return None
+        try:
+            return min(720, max(1, int(value)))
+        except (TypeError, ValueError):
+            return 24
     scheduled_time = str(saved.get("scheduled_time", "09:00"))
     if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", scheduled_time):
         scheduled_time = "09:00"
@@ -65,7 +73,7 @@ def cron_agent_settings(user: User) -> dict:
         "role": str(saved.get("role", ""))[:200],
         "sources": sources or ["linkedin"],
         "jobs_per_run": bounded_int("jobs_per_run", 10, 1, 50),
-        "hours_old": bounded_int("hours_old", 24, 1, 720),
+        "hours_old": posted_age(),
         "interval_hours": bounded_int("interval_hours", 6, 1, 168),
         "scheduled_time": scheduled_time,
         "timezone": str(saved.get("timezone", "Asia/Kolkata"))[:100] or "Asia/Kolkata",

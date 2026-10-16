@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 import smtplib
 from email.message import EmailMessage
 from datetime import UTC, datetime
@@ -209,6 +210,7 @@ def serialize_application(application: Application) -> dict:
             "location": job.location,
             "ai_status": job.ai_status,
             "match_score": job.match_score,
+            "fetched_by_cron": job.fetched_by_cron,
         },
     }
 
@@ -562,6 +564,31 @@ async def _finish_action(db: Session, application: Application, run: _Run, snap:
     return serialize_application(application)
 
 
+async def _finish_or_auto_submit(application: Application, session: FormSession, run: _Run, snap: dict, user: User) -> tuple[dict, bool]:
+    """Continue complete review steps and submit when automatic submission is enabled."""
+    if not bool((user.agent_config or {}).get("auto_submit")):
+        return snap, False
+    for _ in range(12):
+        if not snap.get("has_next") or snap.get("missing_required"):
+            break
+        before_step = snap.get("step")
+        snap = await session.next_step(user, application.job, run.log)
+        if snap.get("step") == before_step:
+            break
+    if not snap.get("can_submit") or snap.get("missing_required"):
+        return snap, False
+    ok, snap, message = await session.submit(run.log)
+    if not ok:
+        await run.log("warning", f"Automatic submission stopped: {message}")
+        return snap, False
+    now = datetime.now(UTC)
+    application.completed_at = now
+    application.applied_at = now
+    application.job.applied_at = now
+    snap["session_open"] = False
+    return snap, True
+
+
 async def fill_from_user(db: Session, user: User, application_id: int, values: dict[str, str], remember: bool, websocket_broker=broker) -> dict:
     application, session = _load(db, user, application_id)
     run = _Run(db, application, websocket_broker, continue_attempt=True)
@@ -578,6 +605,11 @@ async def fill_from_user(db: Session, user: User, application_id: int, values: d
         # Easy Apply: once this step is complete, keep going automatically.
         if session.stepped and not snap["missing_required"] and snap["has_next"]:
             snap = await session.next_step(user, application.job, run.log)
+        snap, submitted = await _finish_or_auto_submit(application, session, run, snap, user)
+    if submitted:
+        result = await _finish_action(db, application, run, snap, status=SUBMITTED, stage=STAGE_SUBMITTED)
+        await form_sessions.close(application_id)
+        return result
     return await _finish_action(db, application, run, snap)
 
 
@@ -586,6 +618,11 @@ async def continue_form(db: Session, user: User, application_id: int, websocket_
     run = _Run(db, application, websocket_broker, continue_attempt=True)
     async with session.lock:
         snap = await session.next_step(user, application.job, run.log) if session.stepped else await session.autofill(user, application.job, run.log)
+        snap, submitted = await _finish_or_auto_submit(application, session, run, snap, user)
+    if submitted:
+        result = await _finish_action(db, application, run, snap, status=SUBMITTED, stage=STAGE_SUBMITTED)
+        await form_sessions.close(application_id)
+        return result
     return await _finish_action(db, application, run, snap)
 
 
@@ -624,6 +661,8 @@ async def instruct_form(db: Session, user: User, application_id: int, instructio
     """Free-text instruction on an open form ("click Continue", "choose India as country")."""
     application, session = _load(db, user, application_id)
     run = _Run(db, application, websocket_broker, continue_attempt=True)
+    submit_requested = bool(re.search(r"\bsubmit(?:\s+application)?\b", instruction, re.IGNORECASE))
+    submitted = False
     async with session.lock:
         snap = await session.instruct(instruction, user, application.job, run.log)
         try:
@@ -637,6 +676,31 @@ async def instruct_form(db: Session, user: User, application_id: int, instructio
             elif all(f["value"] for f in snap["fields"]):
                 # Everything has an answer now (maybe in the wrong format): try Next — it auto-corrects rejected values once.
                 snap = await session.next_step(user, application.job, run.log)
+        if submit_requested:
+            # An explicit "submit" instruction is a user-triggered submission,
+            # not background auto-submit. Finish complete steps before clicking
+            # the final button so retries behave consistently with the UI.
+            for _ in range(12):
+                if not snap["has_next"] or snap["missing_required"]:
+                    break
+                before_step = snap["step"]
+                snap = await session.next_step(user, application.job, run.log)
+                if snap["step"] == before_step:
+                    break
+            if snap["can_submit"] and not snap["missing_required"]:
+                ok, snap, message = await session.submit(run.log)
+                if ok:
+                    application.completed_at = datetime.now(UTC)
+                    application.applied_at = application.completed_at
+                    application.job.applied_at = application.applied_at
+                    snap["session_open"] = False
+                    submitted = True
+                else:
+                    await run.log("warning", f"Submission stopped: {message}")
+    if submitted:
+        result = await _finish_action(db, application, run, snap, status=SUBMITTED, stage=STAGE_SUBMITTED)
+        await form_sessions.close(application_id)
+        return result
     return await _finish_action(db, application, run, snap)
 
 
@@ -648,6 +712,11 @@ async def recheck_form(db: Session, user: User, application_id: int, websocket_b
         snap = await session.recheck(user, application.job, run.log)
         if session.stepped and not snap["missing_required"] and snap["has_next"]:
             snap = await session.autofill(user, application.job, run.log, snap)
+        snap, submitted = await _finish_or_auto_submit(application, session, run, snap, user)
+    if submitted:
+        result = await _finish_action(db, application, run, snap, status=SUBMITTED, stage=STAGE_SUBMITTED)
+        await form_sessions.close(application_id)
+        return result
     return await _finish_action(db, application, run, snap)
 
 
@@ -687,4 +756,3 @@ async def switch_resume(db: Session, user: User, application_id: int, resume_key
     application.form_data = snap
     await run.publish()
     return serialize_application(application), ("attached" if attached else "not_on_this_step")
-

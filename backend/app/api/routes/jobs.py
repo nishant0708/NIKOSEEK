@@ -1,19 +1,26 @@
+import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime
 import inspect
 import logging
 
-from fastapi import APIRouter, HTTPException, status
+import jwt
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import CurrentUser, DbSession
-from app.db.models import Application, ScrapedJob, SearchRun
-from app.schemas.jobs import JobRead, JobScoreRequest, JobScrapeRequest, JobScrapeResponse
+from app.core.config import settings
+from app.db.models import Application, ScrapedJob, SearchRun, User
+from app.db.session import SessionLocal
+from app.schemas.jobs import JobListResponse, JobRead, JobScoreRequest, JobScrapeRequest, JobScrapeResponse
 from app.services.agent_config import get_match_scoring_model, get_match_scoring_prompt
 from app.services.job_matching import SCORING_BATCH_SIZE, attach_analysis, gate_experience, score_jobs, score_jobs_until_target
 from app.services.llm import LLMUnavailableError
 from app.services.resume_agent import resume_agent_settings
 from app.services.resume_store import categories as resume_categories, category_choices
 from app.services.storage import read_details_markdown, read_profile_markdown
+from app.ws.broker import broker
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 logger = logging.getLogger(__name__)
@@ -28,11 +35,33 @@ def row_value(row: object, name: str) -> str | None:
 def to_read(job: ScrapedJob) -> JobRead:
     # SQLAlchemy column defaults are applied during INSERT, while this helper
     # also handles new in-memory jobs before that point.
-    return JobRead(id=job.id, source=job.source, external_url=job.external_url, title=job.title, company=job.company, location=job.location, description=job.description, date_posted=job.date_posted, fetched_by_cron=job.fetched_by_cron, ai_status=job.ai_status or "PENDING", match_score=job.match_score, ai_reason=job.ai_reason, experience_match=job.experience_match, resume_category=job.resume_category)
+    return JobRead(id=job.id, source=job.source, external_url=job.external_url, title=job.title, company=job.company, location=job.location, description=job.description, date_posted=job.date_posted, fetched_by_cron=job.fetched_by_cron, ai_status=job.ai_status or "PENDING", match_score=job.match_score, ai_reason=job.ai_reason, experience_match=job.experience_match, resume_category=job.resume_category, scraped_at=job.scraped_at)
 
 
-@router.post("/scrape", response_model=JobScrapeResponse)
-def scrape_jobs(payload: JobScrapeRequest, user: CurrentUser, db: DbSession) -> JobScrapeResponse:
+def _publish_search_progress(request: Request, user_id: int, run_id: int, fetch_mode: str) -> Callable[..., None]:
+    """Return a thread-safe publisher for real scraper/scorer milestones."""
+    event_loop = getattr(request.app.state, "event_loop", None)
+
+    def publish(stage: str, message: str, **data) -> None:
+        payload = {"type": "job_search.progress", "run_id": run_id, "stage": stage, "message": message,
+                   "fetch_mode": fetch_mode, "data": data}
+        logger.info("Search run %s [%s] %s", run_id, stage, message)
+        if event_loop is None or event_loop.is_closed():
+            return
+        future = asyncio.run_coroutine_threadsafe(broker.send_to_user(user_id, payload), event_loop)
+        # Sending a progress update must not make a search fail if a browser
+        # closes while JobSpy is still working.
+        def log_publish_failure(task) -> None:
+            try:
+                task.result()
+            except Exception as exc:
+                logger.debug("Search websocket publish failed: %s", exc)
+        future.add_done_callback(log_publish_failure)
+
+    return publish
+
+
+def run_scrape_jobs(payload: JobScrapeRequest, user: User, db, publisher_factory: Callable[[int], Callable[..., None]] | None = None) -> JobScrapeResponse:
     unknown = set(payload.sources) - SUPPORTED_SOURCES
     if unknown:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Only LinkedIn and Indeed are available in this phase")
@@ -45,23 +74,32 @@ def scrape_jobs(payload: JobScrapeRequest, user: CurrentUser, db: DbSession) -> 
     db.add(run)
     db.commit()
     db.refresh(run)
+    publish = publisher_factory(run.id) if publisher_factory else None
     logger.info("Search run %s started for user_id=%s, sources=%s, term=%r", run.id, user.id, payload.sources, payload.search_term)
+    if publish:
+        publish("started", "Search started; preparing live job sources.", sources=payload.sources, term=payload.search_term)
     try:
         from jobspy import scrape_jobs as run_scraper
         logger.info("Search run %s: fetching jobs from JobSpy", run.id)
+        if publish:
+            publish("fetching", f"Fetching live {', '.join(payload.sources)} postings.")
         scraper_args = {
             "site_name": payload.sources,
             "search_term": payload.search_term,
             "location": payload.location,
             # The target is accepted matches, so scrape a broader candidate pool.
             "results_wanted": min(100, max(payload.results_wanted, payload.target_relevant_count * 10)),
-            "hours_old": payload.hours_old,
             "job_type": payload.job_type,
             "is_remote": bool(payload.is_remote),
             "verbose": 0,
             # Without this JobSpy returns LinkedIn jobs with NO description, so scoring only saw the title.
             "linkedin_fetch_description": True,
         }
+        # JobSpy interprets an omitted hours_old argument as no posted-date
+        # restriction. Passing None is not equivalent and can fail in some
+        # JobSpy versions.
+        if payload.hours_old is not None:
+            scraper_args["hours_old"] = payload.hours_old
         if "fetch_description" in inspect.signature(run_scraper).parameters:  # newer JobSpy name for the same switch
             scraper_args["fetch_description"] = True
         # JobSpy uses country_indeed to select Indeed's regional catalogue;
@@ -75,9 +113,13 @@ def scrape_jobs(payload: JobScrapeRequest, user: CurrentUser, db: DbSession) -> 
             if url:
                 scraped.append({"source": row_value(row, "site") or payload.sources[0], "external_url": url, "title": row_value(row, "title"), "company": row_value(row, "company"), "location": row_value(row, "location"), "description": row_value(row, "description"), "date_posted": row_value(row, "date_posted")})
         logger.info("Search run %s: JobSpy returned %s usable jobs (%s with a description)", run.id, len(scraped), sum(1 for job in scraped if job["description"]))
+        if publish:
+            publish("fetched", f"Fetched {len(scraped)} usable postings; {sum(1 for job in scraped if job['description'])} include a description.", fetched_count=len(scraped))
         if not scraped:
             run.status = "SUCCEEDED"; run.completed_at = datetime.now(UTC)
             db.commit()
+            if publish:
+                publish("completed", "No matching postings were returned by the live sources.", fetched_count=0, saved_count=0)
             return JobScrapeResponse(run_id=run.id, accepted_jobs=[], rejected_jobs=[], pending_jobs=[], fetched_count=0, saved_count=0)
         model = get_match_scoring_model(user)
         logger.info("Search run %s: scoring up to %s jobs until %s matches are accepted with model=%s", run.id, len(scraped), payload.target_relevant_count, model)
@@ -87,7 +129,18 @@ def scrape_jobs(payload: JobScrapeRequest, user: CurrentUser, db: DbSession) -> 
             categories = category_choices(resume_categories(db, user))
         scoring_unavailable = False
         try:
-            analyses, usage = score_jobs_until_target(scraped, profile, details, payload, model, get_match_scoring_prompt(db), categories)
+            if publish:
+                publish("scoring", f"Scoring up to {len(scraped)} postings against your profile.", total_candidates=len(scraped))
+
+            def on_batch(event: str, start: int, count: int, accepted_count: int) -> None:
+                if not publish:
+                    return
+                if event == "started":
+                    publish("scoring", f"Evaluating jobs {start + 1}–{start + count} of {len(scraped)}.", offset=start, count=count, accepted_count=accepted_count)
+                else:
+                    publish("scoring", f"Scored {min(start + count, len(scraped))} of {len(scraped)} postings; {accepted_count} match(es) accepted so far.", offset=start, count=count, accepted_count=accepted_count)
+
+            analyses, usage = score_jobs_until_target(scraped, profile, details, payload, model, get_match_scoring_prompt(db), categories, on_batch=on_batch)
         except LLMUnavailableError as exc:
             logger.warning("Search run %s: Gemini unavailable; saving %s fetched jobs without scores", run.id, len(scraped))
             analyses, usage = [], {"input": 0, "output": 0, "total": 0}
@@ -133,28 +186,102 @@ def scrape_jobs(payload: JobScrapeRequest, user: CurrentUser, db: DbSession) -> 
         run.llm_input_tokens = usage["input"]; run.llm_output_tokens = usage["output"]; run.llm_total_tokens = usage["total"]
         db.commit()
         logger.info("Search run %s succeeded: accepted=%s rejected=%s saved=%s tokens=%s", run.id, len(accepted), len(rejected), saved_count, usage["total"])
+        if publish:
+            publish("completed", f"Saved {saved_count} jobs: {len(accepted)} accepted, {len(rejected)} rejected, {len(pending)} pending.",
+                    fetched_count=len(scraped), saved_count=saved_count, accepted_count=len(accepted), rejected_count=len(rejected), pending_count=len(pending))
         return JobScrapeResponse(run_id=run.id, accepted_jobs=accepted, rejected_jobs=rejected, pending_jobs=pending, fetched_count=len(scraped), saved_count=saved_count)
     except HTTPException as exc:
         logger.exception("Search run %s failed with HTTP %s: %s", run.id, exc.status_code, exc.detail)
         run.status = "FAILED"; run.error = str(exc.detail); run.completed_at = datetime.now(UTC); db.commit()
+        if publish:
+            publish("failed", f"Search stopped: {exc.detail}")
         raise
     except Exception as exc:
         logger.exception("Search run %s failed unexpectedly", run.id)
         run.status = "FAILED"; run.error = str(exc)[:2000]; run.completed_at = datetime.now(UTC); db.commit()
+        if publish:
+            publish("failed", "Search stopped unexpectedly. Check the backend log for details.")
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Job search failed") from exc
+
+
+@router.post("/scrape", response_model=JobScrapeResponse)
+def scrape_jobs(payload: JobScrapeRequest, user: CurrentUser, db: DbSession, request: Request) -> JobScrapeResponse:
+    # Keep the core callable synchronous: scheduled searches use the same
+    # source/scoring pipeline without a browser websocket.
+    # A run id only exists after the core creates it, so publish starts there.
+    return run_scrape_jobs(payload, user, db,
+                           lambda run_id: _publish_search_progress(request, user.id, run_id, payload.fetch_mode))
+
+
+def _websocket_user(db, token: str) -> User | None:
+    try:
+        claims = jwt.decode(token, settings.jwt_secret_key, algorithms=["HS256"])
+        username = claims.get("sub")
+    except jwt.PyJWTError:
+        return None
+    return db.query(User).filter(User.username == username).one_or_none() if isinstance(username, str) else None
+
+
+@router.websocket("/ws")
+async def search_progress_stream(websocket: WebSocket) -> None:
+    """Authenticated channel for live JobSpy and scoring milestones."""
+    token = websocket.query_params.get("token")
+    db = SessionLocal()
+    user = _websocket_user(db, token or "") if token else None
+    if user is None:
+        db.close()
+        await websocket.close(code=4401)
+        return
+    await broker.connect(user.id, websocket)
+    try:
+        await websocket.send_json({"type": "job_search.ready"})
+        while True:
+            await websocket.receive_text()  # optional client keep-alive
+    except WebSocketDisconnect:
+        pass
+    finally:
+        broker.disconnect(user.id, websocket)
+        db.close()
 
 
 QUEUED_APPLICATION_STATUSES = {"QUEUED", "IN_PROGRESS", "FAILED", "HUMAN_REVIEW_REQUIRED", "APPLIED", "SUCCEEDED"}
 
 
-@router.get("", response_model=list[JobRead])
-def list_jobs(user: CurrentUser, db: DbSession, status_filter: str | None = None) -> list[JobRead]:
+@router.get("", response_model=JobListResponse)
+def list_jobs(user: CurrentUser, db: DbSession, page: int = 1, page_size: int = 12, source: str | None = None,
+              status_filter: str | None = None, q: str | None = None, tag: str | None = None,
+              sort: str = "newest", run_id: int | None = None) -> JobListResponse:
+    """Paged job library. Search and filters execute in Postgres, not in the browser."""
+    page = max(page, 1)
+    page_size = min(max(page_size, 1), 100)
     queued_job_ids = db.query(Application.job_id).filter(Application.user_id == user.id)
-    query = db.query(ScrapedJob).filter(ScrapedJob.user_id == user.id, ~ScrapedJob.id.in_(queued_job_ids))
-    query = query.filter(~ScrapedJob.application_status.in_(QUEUED_APPLICATION_STATUSES))
+    base = db.query(ScrapedJob).filter(ScrapedJob.user_id == user.id, ~ScrapedJob.id.in_(queued_job_ids))
+    base = base.filter(~ScrapedJob.application_status.in_(QUEUED_APPLICATION_STATUSES))
+    source_counts = {name: base.filter(ScrapedJob.source.ilike(name)).count() for name in ("linkedin", "indeed")}
+    source_counts["all"] = sum(source_counts.values())
+    query = base
+    if source in SUPPORTED_SOURCES:
+        query = query.filter(ScrapedJob.source.ilike(source))
     if status_filter:
         query = query.filter(ScrapedJob.ai_status == status_filter.upper())
-    return [to_read(job) for job in query.order_by(ScrapedJob.match_score.desc().nullslast(), ScrapedJob.scraped_at.desc()).all()]
+    if run_id is not None:
+        query = query.filter(ScrapedJob.search_run_id == run_id)
+    if tag:
+        query = query.filter(ScrapedJob.resume_category == tag)
+    if q and q.strip():
+        needle = f"%{q.strip()}%"
+        query = query.filter(or_(ScrapedJob.title.ilike(needle), ScrapedJob.company.ilike(needle),
+                                 ScrapedJob.location.ilike(needle), ScrapedJob.resume_category.ilike(needle)))
+    tags = [value for (value,) in query.with_entities(ScrapedJob.resume_category).filter(ScrapedJob.resume_category.is_not(None)).distinct().order_by(ScrapedJob.resume_category).all() if value]
+    total = query.count()
+    ordering = {
+        "oldest": (ScrapedJob.scraped_at.asc(),),
+        "match_high": (ScrapedJob.match_score.desc().nullslast(), ScrapedJob.scraped_at.desc()),
+        "match_low": (ScrapedJob.match_score.asc().nullslast(), ScrapedJob.scraped_at.desc()),
+    }.get(sort, (ScrapedJob.scraped_at.desc(),))
+    rows = query.order_by(*ordering).offset((page - 1) * page_size).limit(page_size).all()
+    return JobListResponse(items=[to_read(job) for job in rows], page=page, page_size=page_size, total=total,
+                           total_pages=max(1, (total + page_size - 1) // page_size), tags=tags, source_counts=source_counts)
 
 
 def score_pending_jobs(job_ids: list[int], user: CurrentUser, db: DbSession) -> list[JobRead]:

@@ -46,7 +46,7 @@ class CronAgentSettings(BaseModel):
     role: str = Field(default="", max_length=200)
     sources: list[str] = Field(default_factory=lambda: ["linkedin"])
     jobs_per_run: int = Field(default=10, ge=1, le=50)
-    hours_old: int = Field(default=24, ge=1, le=720)
+    hours_old: int | None = Field(default=24, ge=1, le=720)
     interval_hours: int = Field(default=6, ge=1, le=168)
     scheduled_time: str = Field(default="09:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
     timezone: str = Field(default="Asia/Kolkata", min_length=1, max_length=100)

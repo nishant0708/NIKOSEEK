@@ -50,6 +50,9 @@ async def startup() -> None:
     # Database is Supabase Postgres. The private storage bucket and policies
     # are provisioned with supabase/setup.sql.
     Base.metadata.create_all(bind=engine)
+    # Synchronous endpoints (JobSpy runs in FastAPI's threadpool) use this
+    # loop to publish their genuine progress over the websocket.
+    app.state.event_loop = asyncio.get_running_loop()
     app.state.application_queue = asyncio.Queue()
     app.state.application_worker = asyncio.create_task(application_worker())
     from app.services.cron_agent import cron_agent_worker
@@ -74,8 +77,10 @@ async def shutdown() -> None:
 
 async def application_worker() -> None:
     while True:
-        user_id, application_id = await app.state.application_queue.get()
+        user_id, application_id, delay_seconds = await app.state.application_queue.get()
         try:
+            if delay_seconds:
+                await asyncio.sleep(delay_seconds)
             from app.services.applications import process_application
 
             # Own task per application so "Move to failed" can cancel a stuck run without killing the worker.

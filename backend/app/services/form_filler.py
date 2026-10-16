@@ -75,9 +75,40 @@ COLLECT_FIELDS_JS = r"""(scopeEl) => {
     const fs = node.closest('fieldset');
     const legend = fs && fs.querySelector('legend');
     if (legend) return clean(legend.innerText).slice(0, 200);
-    const box = node.closest('[role="radiogroup"], [class*="question"], [class*="field"]');
-    const head = box && box.querySelector('label:not([for]), .label, strong, span');
-    return head ? clean(head.innerText).slice(0, 200) : '';
+    const inputLabelledBy = node.getAttribute('aria-labelledby');
+    if (inputLabelledBy) {
+      const text = inputLabelledBy.split(/\s+/)
+        .map(id => doc.getElementById ? doc.getElementById(id) : document.getElementById(id))
+        .filter(Boolean)
+        .map(el => clean(el.innerText || el.textContent))
+        .find(text => text && !/^radio-group-/i.test(text));
+      if (text) return text.slice(0, 200);
+    }
+    const inputAria = clean(node.getAttribute('aria-label'));
+    if (inputAria && !/^radio-group-/i.test(inputAria) && !/^(yes|no)$/i.test(inputAria)) return inputAria.slice(0, 200);
+    const group = node.closest('[role="radiogroup"]');
+    const labelledBy = group && group.getAttribute('aria-labelledby');
+    if (labelledBy) {
+      const text = labelledBy.split(/\s+/)
+        .map(id => doc.getElementById ? doc.getElementById(id) : document.getElementById(id))
+        .filter(Boolean)
+        .map(el => clean(el.innerText || el.textContent))
+        .find(text => text && !/^radio-group-/i.test(text));
+      if (text) return text.slice(0, 200);
+    }
+    const box = group || node.closest('[class*="question"], [class*="field"]');
+    const candidates = box ? [...box.querySelectorAll('legend, h1, h2, h3, h4, [role="heading"], .application-label, .label, strong, label:not([for]), span')] : [];
+    const radioInputs = box ? [...box.querySelectorAll('input[type="radio"]')] : [];
+    const optionText = new Set(radioInputs
+      .flatMap(input => [...(input.labels || [])].map(label => clean(label.innerText || label.textContent)))
+      .filter(Boolean));
+    const question = candidates
+      .map(el => clean(el.innerText || el.textContent))
+      .filter(text => text && text.length > 2 && text.length <= 300)
+      .filter(text => !/^radio-group-[\w-]+$/i.test(text) && !optionText.has(text))
+      .filter(text => ![...optionText].some(option => option && new RegExp(`(?:^|\\s)${option.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}(?:$|\\s)`, 'i').test(text)))
+      .sort((a, b) => b.length - a.length)[0];
+    return question ? question.slice(0, 200) : '';
   };
   const byIds = (node, attr) => (node.getAttribute(attr) || '').split(/\s+/).filter(Boolean)
     .map(id => { const e = doc.getElementById ? doc.getElementById(id) : document.getElementById(id); return e ? clean(e.textContent) : ''; })

@@ -184,6 +184,7 @@ function QueueGroup({ title, applications, selectedId, onSelect, alert }: {
                   <span className="block truncate text-[13px] font-bold text-ink">{application.job.title ?? 'Untitled job'}</span>
                   <span className="block truncate text-[11px] text-[#805940]">{application.job.company} · {timeAgo(application.created_at)}</span>
                 </span>
+                {application.job.fetched_by_cron && <span className="shrink-0 rounded-full bg-[#F0E7FF] px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide text-[#7541AE]">Cron</span>}
                 {application.pending_question && <Bell size={13} className="mt-1 shrink-0 text-[#E2711D]" />}
               </button>
             );
@@ -353,8 +354,8 @@ export function LiveWorkflow({ token }: { token: string }) {
   // A question can belong to a later queued application while an older application is
   // still running. Follow the application that needs the user before queue order.
   const activeApplication = applications.find(application => application.pending_question)
-    ?? applications.find(application => application.status === 'HUMAN_REVIEW_REQUIRED')
     ?? applications.find(application => application.status === 'IN_PROGRESS')
+    ?? applications.find(application => application.status === 'HUMAN_REVIEW_REQUIRED')
     ?? applications.find(application => application.status === 'PENDING')
     ?? null;
 
