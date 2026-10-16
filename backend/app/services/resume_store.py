@@ -96,12 +96,18 @@ def get_resume(db: Session, user: User, storage_key: str) -> Resume | None:
 
 
 def serialize_resume(row: Resume, uploads: list[ResumePortalUpload] | None = None) -> dict:
+    uploads = uploads or []
     return {
         "id": row.id, "storage_key": row.storage_key, "role": row.category, "category": row.category,
         "file_name": Path(row.storage_key).name, "label": row.label, "origin": row.origin, "upload_name": row.upload_name,
         "parent_id": row.parent_id, "source_job_id": row.source_job_id,
         "created_at": row.created_at.isoformat() if row.created_at else None,
-        "portals": {u.portal: u.display_name for u in (uploads or [])},
+        # Each board may show a different filename for the same stored resume.
+        "portals": {u.portal: u.display_name for u in uploads},
+        "sources": [{"source": u.portal, "display_name": u.display_name,
+                     "uploaded_at": u.uploaded_at.isoformat() if u.uploaded_at else None,
+                     "last_used_at": u.last_used_at.isoformat() if u.last_used_at else None}
+                    for u in uploads],
     }
 
 

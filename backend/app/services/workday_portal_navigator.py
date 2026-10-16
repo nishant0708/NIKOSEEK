@@ -154,13 +154,18 @@ async def _start_option(frame, key: str):
 
 
 def _start_order(user: User, vendor: str, tenant: str, has_resume: bool) -> list[str]:
-    """Which "Start Your Application" option to take:
-    * this company already knows you (ats_accounts[workday][tenant]) -> Use My Last Application: everything you
-      entered there last time comes back pre-filled
-    * otherwise Autofill with Resume (Workday reads your CV into the form), then Apply Manually as the fallback."""
-    order = ["last"] if ats_account_known(user, vendor, tenant) else []
-    order += ["resume"] if has_resume else []
-    return order + ["manual", "resume", "last"]
+    """Prefer the resume chosen for this application over a portal's saved previous application.
+
+    "Use My Last Application" may restore an older resume, ignoring the resume agent's per-job choice.
+    Keep it as a fallback when the current resume option is unavailable.
+    """
+    if has_resume:
+        # Manual entry still lets the form session attach this exact file later;
+        # reusing an older submission can silently substitute its resume.
+        return ["resume", "manual", "last"]
+    if ats_account_known(user, vendor, tenant):
+        return ["last", "manual", "resume"]
+    return ["manual", "resume", "last"]
 
 
 async def _upload_resume_step(page, log) -> bool:

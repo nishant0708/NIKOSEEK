@@ -22,15 +22,22 @@ Helpers live in:
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
+import re
+import smtplib
+from email.message import EmailMessage
 from datetime import UTC, datetime
+from urllib.parse import parse_qs, urlparse
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.models import Application, ScrapedJob, User
+from app.core.config import settings
 from app.services.agent_assist import questions
 from app.services.agent_log import AgentLog
+from app.services.llm import LLMUnavailableError
 from app.services.live_view import live_view
 from app.services.form_filler import remember_answers, remember_notes
 from app.services.form_session import FormSession, form_sessions
@@ -65,6 +72,99 @@ STAGE_NEEDS_INPUT = "Needs your input ({n} field(s))"
 STAGE_READY = "Ready to submit — review and press Submit"
 STAGE_SUBMITTED = "Submitted"
 SUBMITTED = "SUBMITTED"
+
+
+def _indeed_job_key(url: str) -> str | None:
+    """Indeed's stable posting identity survives its verification query params."""
+    try:
+        return parse_qs(urlparse(url).query).get("jk", [None])[0]
+    except Exception:
+        return None
+
+
+def _on_expected_indeed_job(url: str, job_url: str) -> bool:
+    expected = _indeed_job_key(job_url)
+    return bool(expected and _indeed_job_key(url) == expected)
+
+
+async def _send_application_receipt(application: Application, snap: dict) -> None:
+    """Email the user a copy of the values that were present after a successful submit."""
+    config = application.user.agent_config or {}
+    recipients = [entry.get("email") for entry in (config.get("linkedin"), config.get("indeed"))
+                  if isinstance(entry, dict) and isinstance(entry.get("email"), str) and entry["email"].strip()]
+    recipient = settings.smtp_receipt_email or next(iter(dict.fromkeys(recipients)), None)
+    if not recipient:
+        logger.info("No recipient email configured for application %s; receipt email skipped", application.id)
+        return
+    if not settings.smtp_host or not settings.smtp_from_email:
+        logger.warning("SMTP is not configured; application receipt email skipped for application %s", application.id)
+        return
+    answers = [a for a in snap.get("answers", []) if a.get("value")]
+    lines = [f"{a.get('label', 'Field')}: {a.get('value', '')}" for a in answers]
+    title = application.job.title or "Job application"
+    company = application.job.company or "Company not specified"
+    url = application.application_url or ""
+    message = EmailMessage()
+    message["Subject"] = f"Application submitted — {title} at {company}"
+    message["From"] = settings.smtp_from_email
+    message["To"] = recipient
+    message.set_content(
+        "APPLICATION SUBMITTED\n\n"
+        "Your application was submitted successfully. Here is a copy of the information recorded on the form.\n\n"
+        f"Position: {title}\nCompany: {company}\n"
+        + (f"Application page: {url}\n" if url else "")
+        + "\nINFORMATION SUBMITTED\n"
+        + ("\n".join(lines) if lines else "No form answers were captured.")
+        + "\n\nThis is an automated confirmation for your records."
+    )
+    answer_rows = "".join(
+        "<tr>"
+        f"<td style=\"padding:12px 14px;border-bottom:1px solid #eee7df;color:#6b5142;font-weight:600;width:38%;vertical-align:top\">{html.escape(str(answer.get('label') or 'Field'))}</td>"
+        f"<td style=\"padding:12px 14px;border-bottom:1px solid #eee7df;color:#29231f;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere\">{html.escape(str(answer.get('value') or ''))}</td>"
+        "</tr>"
+        for answer in answers
+    )
+    application_link = (
+        f'<p style="margin:22px 0 0"><a href="{html.escape(url, quote=True)}" '
+        'style="display:inline-block;background:#e86e32;color:#fff;text-decoration:none;font-weight:700;'
+        'padding:11px 18px;border-radius:8px">View application page</a></p>'
+        if url else ""
+    )
+    html_body = f"""<!doctype html>
+<html lang="en"><body style="margin:0;padding:0;background:#f5f2ee;font-family:Arial,Helvetica,sans-serif;color:#29231f">
+  <div style="max-width:640px;margin:32px auto;padding:0 16px">
+    <div style="background:#30251f;padding:20px 28px;border-radius:14px 14px 0 0;color:#fff">
+      <div style="font-size:12px;letter-spacing:1.6px;text-transform:uppercase;color:#f4b28c;font-weight:700">Application update</div>
+      <div style="font-size:22px;line-height:1.3;font-weight:700;margin-top:8px">Your application was submitted</div>
+    </div>
+    <div style="background:#fff;padding:28px;border:1px solid #e9e1d9;border-top:0;border-radius:0 0 14px 14px">
+      <p style="margin:0 0 20px;line-height:1.6;color:#59483d">The application was submitted successfully. Keep this email as a record of the information entered.</p>
+      <div style="background:#fbf8f4;border:1px solid #eee7df;border-radius:10px;padding:16px 18px">
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#98745e;font-weight:700">Position</div>
+        <div style="font-size:17px;font-weight:700;margin-top:5px">{html.escape(str(title))}</div>
+        <div style="font-size:14px;color:#6b5142;margin-top:4px">{html.escape(str(company))}</div>
+      </div>
+      <h2 style="font-size:15px;margin:26px 0 10px">Information submitted</h2>
+      {('<div style="border:1px solid #eee7df;border-radius:10px;overflow:hidden"><table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;font-size:13px">' + answer_rows + '</table></div>') if answer_rows else '<p style="color:#6b5142;font-size:14px">No form answers were captured.</p>'}
+      {application_link}
+      <p style="border-top:1px solid #eee7df;margin:28px 0 0;padding-top:16px;color:#9a8b80;font-size:11px;line-height:1.5">This is an automated confirmation for your records. Please contact the employer directly if you need to update your application.</p>
+    </div>
+  </div>
+</body></html>"""
+    message.add_alternative(html_body, subtype="html")
+
+    def deliver() -> None:
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=20) as server:
+            if settings.smtp_use_tls:
+                server.starttls()
+            if settings.smtp_username:
+                server.login(settings.smtp_username, settings.smtp_password or "")
+            server.send_message(message)
+    try:
+        await asyncio.to_thread(deliver)
+        logger.info("Sent application receipt email for application %s", application.id)
+    except Exception:
+        logger.exception("Could not send application receipt email for application %s", application.id)
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +210,7 @@ def serialize_application(application: Application) -> dict:
             "location": job.location,
             "ai_status": job.ai_status,
             "match_score": job.match_score,
+            "fetched_by_cron": job.fetched_by_cron,
         },
     }
 
@@ -275,6 +376,18 @@ async def _run_pipeline(run: _Run, user: User) -> None:
     await relogin(page)
     if source == LINKEDIN and not page.is_closed() and "/jobs/view/" not in page.url:
         await page.goto(job_url, wait_until="domcontentloaded", timeout=60000)
+    elif source == INDEED and not page.is_closed() and not _on_expected_indeed_job(page.url, job_url):
+        # Indeed often completes Cloudflare/passkey verification on account
+        # settings or home. Let its session settle, then use a fresh tab so the
+        # navigator never asks the LLM to recover from an unrelated page.
+        await run.log("info", "Indeed verification finished away from the posting. Waiting briefly, then reopening this job in a new tab.",
+                      data={"url": page.url, "job_url": job_url}, stage_key="login")
+        await page.wait_for_timeout(75_000)
+        page = await context.new_page()
+        await page.bring_to_front()
+        await page.goto(job_url, wait_until="domcontentloaded", timeout=60_000)
+        log.track(page)
+        await run.log("action", f"Reopened Indeed job in a fresh tab: {page.url}", data={"url": page.url, "job_url": job_url}, stage_key="login")
 
     # 2b. Resume agent (Workflow page toggle): score your resumes against this JD, tailor one if it's worth it.
     #     Runs on the open posting so a missing JD (older LinkedIn searches) can be read from the page.
@@ -310,6 +423,30 @@ async def _run_pipeline(run: _Run, user: User) -> None:
     application.application_url = page.url
     job.application_id = application.id
     await page.bring_to_front()
+    if bool((user.agent_config or {}).get("auto_submit")):
+        async with session.lock:
+            # Advance only through complete steps; never skip an unanswered required field.
+            for _ in range(12):
+                if not snap.get("has_next") or snap.get("missing_required"):
+                    break
+                before_step = snap.get("step")
+                snap = await session.next_step(user, job, log)
+                if snap.get("step") == before_step:
+                    break
+            if snap.get("can_submit") and not snap.get("missing_required"):
+                ok, snap, message = await session.submit(log)
+                application.form_data = snap
+                if ok:
+                    now = datetime.now(UTC)
+                    application.completed_at = now
+                    application.applied_at = now
+                    job.applied_at = now
+                    snap["session_open"] = False
+                    await run.stage("review", "Submitted automatically", status=SUBMITTED)
+                    await form_sessions.close(application.id)
+                    await _send_application_receipt(application, snap)
+                    return
+                await log("warning", f"Automatic submission stopped: {message}")
     await run.stage("review", _review_stage(snap), status="HUMAN_REVIEW_REQUIRED")
 
 
@@ -342,6 +479,12 @@ async def process_application(application_id: int, session_factory, user_id: int
             # Stopped from the UI ("Move to failed"). The status was already set by set_application_status.
             logger.info("Application %s run was stopped by the user", application_id)
             db.rollback()
+        except LLMUnavailableError as exc:
+            logger.warning("Application %s paused because all configured AI models were unavailable", application_id)
+            db.rollback()
+            application.error = str(exc)[:2000]
+            await run.publish(stage="AI unavailable — live application session retained for review", status="HUMAN_REVIEW_REQUIRED")
+            await run.log("warning", "AI models were unavailable. The application was left open for review and was not marked failed.", data={"type": type(exc).__name__})
         except Exception as exc:
             if isinstance(exc, (LinkedInAuthRequired, IndeedAuthRequired)):
                 logger.warning("Application %s needs provider login: %s", application_id, exc)
@@ -421,6 +564,31 @@ async def _finish_action(db: Session, application: Application, run: _Run, snap:
     return serialize_application(application)
 
 
+async def _finish_or_auto_submit(application: Application, session: FormSession, run: _Run, snap: dict, user: User) -> tuple[dict, bool]:
+    """Continue complete review steps and submit when automatic submission is enabled."""
+    if not bool((user.agent_config or {}).get("auto_submit")):
+        return snap, False
+    for _ in range(12):
+        if not snap.get("has_next") or snap.get("missing_required"):
+            break
+        before_step = snap.get("step")
+        snap = await session.next_step(user, application.job, run.log)
+        if snap.get("step") == before_step:
+            break
+    if not snap.get("can_submit") or snap.get("missing_required"):
+        return snap, False
+    ok, snap, message = await session.submit(run.log)
+    if not ok:
+        await run.log("warning", f"Automatic submission stopped: {message}")
+        return snap, False
+    now = datetime.now(UTC)
+    application.completed_at = now
+    application.applied_at = now
+    application.job.applied_at = now
+    snap["session_open"] = False
+    return snap, True
+
+
 async def fill_from_user(db: Session, user: User, application_id: int, values: dict[str, str], remember: bool, websocket_broker=broker) -> dict:
     application, session = _load(db, user, application_id)
     run = _Run(db, application, websocket_broker, continue_attempt=True)
@@ -437,6 +605,11 @@ async def fill_from_user(db: Session, user: User, application_id: int, values: d
         # Easy Apply: once this step is complete, keep going automatically.
         if session.stepped and not snap["missing_required"] and snap["has_next"]:
             snap = await session.next_step(user, application.job, run.log)
+        snap, submitted = await _finish_or_auto_submit(application, session, run, snap, user)
+    if submitted:
+        result = await _finish_action(db, application, run, snap, status=SUBMITTED, stage=STAGE_SUBMITTED)
+        await form_sessions.close(application_id)
+        return result
     return await _finish_action(db, application, run, snap)
 
 
@@ -445,6 +618,11 @@ async def continue_form(db: Session, user: User, application_id: int, websocket_
     run = _Run(db, application, websocket_broker, continue_attempt=True)
     async with session.lock:
         snap = await session.next_step(user, application.job, run.log) if session.stepped else await session.autofill(user, application.job, run.log)
+        snap, submitted = await _finish_or_auto_submit(application, session, run, snap, user)
+    if submitted:
+        result = await _finish_action(db, application, run, snap, status=SUBMITTED, stage=STAGE_SUBMITTED)
+        await form_sessions.close(application_id)
+        return result
     return await _finish_action(db, application, run, snap)
 
 
@@ -483,6 +661,8 @@ async def instruct_form(db: Session, user: User, application_id: int, instructio
     """Free-text instruction on an open form ("click Continue", "choose India as country")."""
     application, session = _load(db, user, application_id)
     run = _Run(db, application, websocket_broker, continue_attempt=True)
+    submit_requested = bool(re.search(r"\bsubmit(?:\s+application)?\b", instruction, re.IGNORECASE))
+    submitted = False
     async with session.lock:
         snap = await session.instruct(instruction, user, application.job, run.log)
         try:
@@ -496,6 +676,31 @@ async def instruct_form(db: Session, user: User, application_id: int, instructio
             elif all(f["value"] for f in snap["fields"]):
                 # Everything has an answer now (maybe in the wrong format): try Next — it auto-corrects rejected values once.
                 snap = await session.next_step(user, application.job, run.log)
+        if submit_requested:
+            # An explicit "submit" instruction is a user-triggered submission,
+            # not background auto-submit. Finish complete steps before clicking
+            # the final button so retries behave consistently with the UI.
+            for _ in range(12):
+                if not snap["has_next"] or snap["missing_required"]:
+                    break
+                before_step = snap["step"]
+                snap = await session.next_step(user, application.job, run.log)
+                if snap["step"] == before_step:
+                    break
+            if snap["can_submit"] and not snap["missing_required"]:
+                ok, snap, message = await session.submit(run.log)
+                if ok:
+                    application.completed_at = datetime.now(UTC)
+                    application.applied_at = application.completed_at
+                    application.job.applied_at = application.applied_at
+                    snap["session_open"] = False
+                    submitted = True
+                else:
+                    await run.log("warning", f"Submission stopped: {message}")
+    if submitted:
+        result = await _finish_action(db, application, run, snap, status=SUBMITTED, stage=STAGE_SUBMITTED)
+        await form_sessions.close(application_id)
+        return result
     return await _finish_action(db, application, run, snap)
 
 
@@ -507,6 +712,11 @@ async def recheck_form(db: Session, user: User, application_id: int, websocket_b
         snap = await session.recheck(user, application.job, run.log)
         if session.stepped and not snap["missing_required"] and snap["has_next"]:
             snap = await session.autofill(user, application.job, run.log, snap)
+        snap, submitted = await _finish_or_auto_submit(application, session, run, snap, user)
+    if submitted:
+        result = await _finish_action(db, application, run, snap, status=SUBMITTED, stage=STAGE_SUBMITTED)
+        await form_sessions.close(application_id)
+        return result
     return await _finish_action(db, application, run, snap)
 
 
@@ -546,4 +756,3 @@ async def switch_resume(db: Session, user: User, application_id: int, resume_key
     application.form_data = snap
     await run.publish()
     return serialize_application(application), ("attached" if attached else "not_on_this_step")
-

@@ -1,3 +1,6 @@
+from datetime import datetime
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -9,11 +12,14 @@ class JobScrapeRequest(BaseModel):
     job_type: str | None = Field(default=None, max_length=50, description="e.g. fulltime, parttime, internship")
     # JobSpy requires a concrete boolean; clients may omit this to mean false.
     is_remote: bool = False
-    hours_old: int = Field(default=168, ge=1, le=720)
+    # None means no posted-date restriction.
+    hours_old: int | None = Field(default=168, ge=1, le=720)
     results_wanted: int = Field(default=20, ge=1, le=100)
     experience: str = Field(min_length=1, max_length=100)
     min_salary_lpa: int | None = Field(default=None, ge=0, le=1000)
     target_relevant_count: int = Field(default=10, ge=1, le=50)
+    # Internal scheduler marker. The public search form always uses "manual".
+    fetch_mode: Literal["manual", "cron"] = "manual"
 
 
 class JobRead(BaseModel):
@@ -25,16 +31,33 @@ class JobRead(BaseModel):
     location: str | None = None
     description: str | None = None
     date_posted: str | None = None
+    fetched_by_cron: bool = False
     ai_status: str = "PENDING"
     match_score: float | None = None
     ai_reason: str | None = None
     experience_match: str | None = None
     resume_category: str | None = None
+    scraped_at: datetime | None = None
+
+
+class JobScoreRequest(BaseModel):
+    job_ids: list[int] = Field(min_length=1, max_length=100)
 
 
 class JobScrapeResponse(BaseModel):
     run_id: int
     accepted_jobs: list[JobRead]
     rejected_jobs: list[JobRead]
+    pending_jobs: list[JobRead] = Field(default_factory=list)
     fetched_count: int
     saved_count: int
+
+
+class JobListResponse(BaseModel):
+    items: list[JobRead]
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
+    tags: list[str] = Field(default_factory=list)
+    source_counts: dict[str, int] = Field(default_factory=dict)

@@ -9,9 +9,8 @@ from __future__ import annotations
 import json
 import re
 
-from sqlalchemy.orm.attributes import flag_modified
-
-from app.db.models import User
+from sqlalchemy.orm import object_session
+from app.db.models import SystemPrompt, User
 
 PLACEHOLDER = re.compile(r"\{\{\s*([a-z_]+)\s*\}\}")
 
@@ -274,6 +273,12 @@ def _overrides(user: User) -> dict:
 
 def get_template(user: User | None, key: str) -> str:
     if user is not None:
+        db = object_session(user)
+        if db is not None:
+            record = db.query(SystemPrompt).filter(SystemPrompt.key == f"agent_prompt:{key}").first()
+            if record is not None and record.content.strip():
+                return record.content
+    if user is not None:
         custom = _overrides(user).get(key)
         if isinstance(custom, str) and custom.strip():
             return custom
@@ -294,10 +299,11 @@ def render(user: User | None, key: str, **values) -> str:
 
 
 def list_prompts(user: User) -> list[dict]:
-    overrides = _overrides(user)
+    db = object_session(user)
     out = []
     for key, meta in PROMPTS.items():
-        custom = overrides.get(key)
+        record = db.query(SystemPrompt).filter(SystemPrompt.key == f"agent_prompt:{key}").first() if db is not None else None
+        custom = record.content if record is not None else _overrides(user).get(key)
         out.append({
             "key": key,
             "title": meta["title"],
@@ -317,14 +323,17 @@ def missing_variables(key: str, content: str) -> list[str]:
 
 
 def set_prompt(user: User, key: str, content: str | None) -> None:
-    from app.services.agent_config import fresh_config
-
-    config = fresh_config(user)
-    prompts = dict(config.get("prompts")) if isinstance(config.get("prompts"), dict) else {}
+    db = object_session(user)
+    if db is None:
+        raise RuntimeError("Prompt updates require a database session")
+    prompt_key = f"agent_prompt:{key}"
+    record = db.query(SystemPrompt).filter(SystemPrompt.key == prompt_key).first()
     if content is None or content.strip() == PROMPTS[key]["template"].strip():
-        prompts.pop(key, None)
+        if record is not None:
+            db.delete(record)
+        return
+    if record is None:
+        db.add(SystemPrompt(key=prompt_key, content=content, updated_by_user_id=user.id))
     else:
-        prompts[key] = content
-    config["prompts"] = prompts
-    user.agent_config = config
-    flag_modified(user, "agent_config")
+        record.content = content
+        record.updated_by_user_id = user.id

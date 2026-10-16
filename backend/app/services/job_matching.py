@@ -1,4 +1,5 @@
 import json
+from collections.abc import Callable
 
 from app.schemas.jobs import JobRead, JobScrapeRequest
 from app.services.job_requirements import experience_gate
@@ -15,7 +16,7 @@ MATCH_SCHEMA = {
 # Keep each request small enough that a search can stop before scoring every
 # scraped posting. A batch may contain a few jobs beyond the final accepted
 # result, but no later batches are sent to the model.
-SCORING_BATCH_SIZE = 5
+SCORING_BATCH_SIZE = 10
 
 
 # Appended in code (not part of the editable prompt) so a customised prompt can't lose these rules.
@@ -71,7 +72,7 @@ def score_jobs(jobs: list[dict], profile_markdown: str, details_markdown: str, p
 
 
 def score_jobs_until_target(jobs: list[dict], profile_markdown: str, details_markdown: str, preferences: JobScrapeRequest, model: str, system_prompt: str,
-                            categories: list[str] | None = None) -> tuple[list[dict], dict[str, int]]:
+                            categories: list[str] | None = None, on_batch: Callable[[str, int, int, int], None] | None = None) -> tuple[list[dict], dict[str, int]]:
     """Score ordered jobs in batches, making no further LLM calls after the target is met."""
     analyses: list[dict] = []
     usage = {"input": 0, "output": 0, "total": 0}
@@ -79,6 +80,8 @@ def score_jobs_until_target(jobs: list[dict], profile_markdown: str, details_mar
 
     for start in range(0, len(jobs), SCORING_BATCH_SIZE):
         batch = list(enumerate(jobs[start:start + SCORING_BATCH_SIZE], start=start + 1))
+        if on_batch:
+            on_batch("started", start, len(batch), accepted_count)
         batch_analyses, batch_usage = _score_batch(batch, profile_markdown, details_markdown, preferences, model, system_prompt, categories)
         for key in usage:
             usage[key] += batch_usage[key]
@@ -91,7 +94,11 @@ def score_jobs_until_target(jobs: list[dict], profile_markdown: str, details_mar
             if analysis.get("accepted"):
                 accepted_count += 1
                 if accepted_count >= preferences.target_relevant_count:
+                    if on_batch:
+                        on_batch("completed", start, len(batch), accepted_count)
                     return analyses, usage
+        if on_batch:
+            on_batch("completed", start, len(batch), accepted_count)
 
     return analyses, usage
 

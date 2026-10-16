@@ -15,7 +15,7 @@ import logging
 import re
 from pathlib import Path
 
-from app.services.form_filler import is_resume_choice, resolve_root, set_field_value, upload_resume
+from app.services.form_filler import RESUME_FILE_OPTION, collect_fields, is_resume_choice, resolve_root, set_field_value, upload_resume
 from app.services.resume_store import forget_portal_upload, portal_display_name, record_portal_upload, upload_name_for
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,12 @@ def match_resume_option(options: list[str], target: str) -> str | None:
 
 
 async def _click_listed(scope, name: str) -> bool:
-    """Fallback for card-style resume pickers (no radio inputs): click the card whose text is exactly the file name."""
+    """Fallback for card-style resume pickers (no radio inputs).
+
+    LinkedIn often renders a card as ``filename + Uploaded date`` rather than
+    a radio label, so an exact-text lookup alone silently leaves the account's
+    default resume selected after a new file upload.
+    """
     try:
         target = scope.get_by_text(name, exact=True)
         for i in range(min(await target.count(), 3)):
@@ -53,9 +58,51 @@ async def _click_listed(scope, name: str) -> bool:
                 clickable = item.locator("xpath=ancestor-or-self::*[self::label or self::button or @role='radio' or @role='button' or @role='option'][1]")
                 await (clickable.first if await clickable.count() else item).click(timeout=4000)
                 return True
+        # The displayed name may include an upload date or drop the extension.
+        # Only click a candidate when its normalized filename matches ours;
+        # never choose the first/default resume card.
+        wanted = _stem(name)
+        candidates = scope.locator('label, button, [role="radio"], [role="option"], [role="button"]')
+        for i in range(min(await candidates.count(), 100)):
+            item = candidates.nth(i)
+            if not await item.is_visible():
+                continue
+            text = await item.inner_text(timeout=1500)
+            if wanted and wanted in re.sub(r"[^a-z0-9]", "", text.lower()):
+                await item.click(timeout=4000)
+                return True
     except Exception as exc:
         logger.debug("Resume card click failed for %s: %s", name, exc)
     return False
+
+
+async def _select_uploaded_resume(frame, scope, root: str | None, name: str) -> str | None:
+    """Wait for a board to add a just-uploaded resume and make it the choice.
+
+    Uploading through a hidden file input does not reliably select that file in
+    LinkedIn Easy Apply.  Re-scan the picker after the board processes the
+    upload, then select the matching option explicitly.
+    """
+    for _ in range(6):
+        try:
+            refreshed = await collect_fields(frame, root)
+            choice = next((field for field in refreshed if is_resume_choice(field)), None)
+            if choice:
+                matched = match_resume_option(choice.get("options") or [], name)
+                if matched:
+                    await set_field_value(frame, choice, matched)
+                    # Verify against a fresh scan: this prevents reporting the
+                    # upload while an older default remains selected.
+                    verified = await collect_fields(frame, root)
+                    selected = next((field for field in verified if is_resume_choice(field)), None)
+                    if selected and match_resume_option([str(selected.get("value") or "")], name):
+                        return matched
+            elif await _click_listed(scope, name):
+                return name
+        except Exception:
+            logger.debug("Could not select just-uploaded resume %s yet", name, exc_info=True)
+        await frame.wait_for_timeout(750)
+    return None
 
 
 async def attach_resume(frame, fields: list[dict], *, mode: str, resume_key: str | None, user_id: int, username: str,
@@ -89,5 +136,24 @@ async def attach_resume(frame, fields: list[dict], *, mode: str, resume_key: str
 
     uploaded = await upload_resume(frame, resume_key, username, root, user_id=user_id, replace=replace)
     if uploaded and portal:
-        await asyncio.to_thread(record_portal_upload, user_id, resume_key, portal, uploaded, uploaded=True)
+        # Some boards display a normalized/stored name that differs from the local filename.
+        # Capture the visible choice when available, scoped to this specific board.
+        display_name = uploaded
+        try:
+            # Selecting the new file is mandatory for LinkedIn: its existing
+            # default radio option otherwise remains active. The helper also
+            # handles card-style pickers and waits for the async upload UI.
+            selected_name = await _select_uploaded_resume(frame, scope, root, uploaded)
+            if selected_name:
+                display_name = selected_name
+            else:
+                logger.warning("Resume %s was uploaded but did not become the selected %s resume", uploaded, portal)
+                # Do not remember this as usable. On the next attempt we will
+                # upload/select again instead of trusting a stale default.
+                return None, None
+        except Exception:
+            logger.debug("Could not select the board's displayed resume after upload", exc_info=True)
+            return None, None
+        await asyncio.to_thread(record_portal_upload, user_id, resume_key, portal, display_name, uploaded=True)
+        uploaded = display_name
     return (uploaded, "uploaded") if uploaded else (None, None)

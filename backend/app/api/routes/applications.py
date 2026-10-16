@@ -152,9 +152,9 @@ async def apply_jobs(payload: ApplicationQueueRequest, user: CurrentUser, db: Db
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
-    queue: asyncio.Queue[tuple[int, int]] = request.app.state.application_queue
+    queue: asyncio.Queue[tuple[int, int, float]] = request.app.state.application_queue
     for application in applications:
-        queue.put_nowait((user.id, application.id))
+        queue.put_nowait((user.id, application.id, 0.0))
     return ApplicationQueueResponse(message="Applications queued", applications=[_serialize(application) for application in applications])
 
 

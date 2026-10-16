@@ -36,7 +36,7 @@ FIELD_KEY_PATTERNS: list[tuple[tuple[str, ...], str]] = [
     (("last name", "lastname", "family-name", "surname", "family_name"), "last_name"),
     (("full name", "your name", "legal name"), "full_name"),
     (("email", "e-mail"), "email"),
-    (("notice period", "notice-period", "availability", "available to join"), "notice_period"),
+    (("notice period", "notice-period", "notice", "availability", "available to join", "available to start", "when can you join", "when can you start"), "notice_period"),
     (("phone", "mobile", "tel"), "phone"),
     (("city",), "city"),
     (("country",), "country"),
@@ -75,9 +75,40 @@ COLLECT_FIELDS_JS = r"""(scopeEl) => {
     const fs = node.closest('fieldset');
     const legend = fs && fs.querySelector('legend');
     if (legend) return clean(legend.innerText).slice(0, 200);
-    const box = node.closest('[role="radiogroup"], [class*="question"], [class*="field"]');
-    const head = box && box.querySelector('label:not([for]), .label, strong, span');
-    return head ? clean(head.innerText).slice(0, 200) : '';
+    const inputLabelledBy = node.getAttribute('aria-labelledby');
+    if (inputLabelledBy) {
+      const text = inputLabelledBy.split(/\s+/)
+        .map(id => doc.getElementById ? doc.getElementById(id) : document.getElementById(id))
+        .filter(Boolean)
+        .map(el => clean(el.innerText || el.textContent))
+        .find(text => text && !/^radio-group-/i.test(text));
+      if (text) return text.slice(0, 200);
+    }
+    const inputAria = clean(node.getAttribute('aria-label'));
+    if (inputAria && !/^radio-group-/i.test(inputAria) && !/^(yes|no)$/i.test(inputAria)) return inputAria.slice(0, 200);
+    const group = node.closest('[role="radiogroup"]');
+    const labelledBy = group && group.getAttribute('aria-labelledby');
+    if (labelledBy) {
+      const text = labelledBy.split(/\s+/)
+        .map(id => doc.getElementById ? doc.getElementById(id) : document.getElementById(id))
+        .filter(Boolean)
+        .map(el => clean(el.innerText || el.textContent))
+        .find(text => text && !/^radio-group-/i.test(text));
+      if (text) return text.slice(0, 200);
+    }
+    const box = group || node.closest('[class*="question"], [class*="field"]');
+    const candidates = box ? [...box.querySelectorAll('legend, h1, h2, h3, h4, [role="heading"], .application-label, .label, strong, label:not([for]), span')] : [];
+    const radioInputs = box ? [...box.querySelectorAll('input[type="radio"]')] : [];
+    const optionText = new Set(radioInputs
+      .flatMap(input => [...(input.labels || [])].map(label => clean(label.innerText || label.textContent)))
+      .filter(Boolean));
+    const question = candidates
+      .map(el => clean(el.innerText || el.textContent))
+      .filter(text => text && text.length > 2 && text.length <= 300)
+      .filter(text => !/^radio-group-[\w-]+$/i.test(text) && !optionText.has(text))
+      .filter(text => ![...optionText].some(option => option && new RegExp(`(?:^|\\s)${option.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}(?:$|\\s)`, 'i').test(text)))
+      .sort((a, b) => b.length - a.length)[0];
+    return question ? question.slice(0, 200) : '';
   };
   const byIds = (node, attr) => (node.getAttribute(attr) || '').split(/\s+/).filter(Boolean)
     .map(id => { const e = doc.getElementById ? doc.getElementById(id) : document.getElementById(id); return e ? clean(e.textContent) : ''; })
@@ -300,7 +331,7 @@ def profile_answers(username: str) -> dict[str, str]:
 def profile_answers_from_text(text: str) -> dict[str, str]:
     """Explicit notice period ("notice period: 30 days", "can join in 2 weeks", "immediate joiner" -> 0) in days."""
     notice = re.search(
-        r"(?:notice\s*period|available\s*to\s*join|availability|join\s*(?:in|within|after))[^\n]*?"
+        r"(?:notice(?:\s*period)?|available\s*to\s*(?:join|start)|availability|when\s*(?:can|would).*?(?:join|start)|join\s*(?:in|within|after))[^\n]*?"
         r"(\d+(?:\.\d+)?)\s*(days?|weeks?|months?)",
         text,
         re.I,
@@ -465,6 +496,36 @@ async def _click(locator, timeout: int = 5000) -> None:
             await locator.evaluate("el => el.click()")
 
 
+async def _fill_text(locator, value: str, timeout: int = 15000) -> None:
+    """Fill a text control, with a fallback for sluggish controlled form widgets."""
+    try:
+        await locator.fill(value, timeout=timeout)
+        return
+    except Exception as fill_error:
+        # Some ATS controls remain editable but never become actionable to Playwright.
+        # Set the native value and dispatch the events framework-controlled forms listen for.
+        try:
+            result = await asyncio.wait_for(locator.evaluate(
+                """(el, value) => {
+                  if (!el.isConnected || el.disabled || el.readOnly) return false;
+                  const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                  const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                  if (!setter) return false;
+                  el.focus();
+                  setter.call(el, value);
+                  el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+                  el.dispatchEvent(new Event('change', { bubbles: true }));
+                  return el.value === value;
+                }""",
+                value,
+            ), timeout=3)
+            if result:
+                return
+        except Exception:
+            pass
+        raise fill_error
+
+
 async def resolve_values(fields: list[dict], user: User, job, notes: list[str] | None = None, *, recheck_all: bool = False,
                          protect: set[str] | None = None) -> tuple[dict[str, str], str]:
     """`protect`: keys the applicant set themselves on this step — never overwritten (not even by the fixed rules below)."""
@@ -478,7 +539,7 @@ async def resolve_values(fields: list[dict], user: User, job, notes: list[str] |
         if told:
             answers["notice_period"] = told
     for field in fields:
-        if re.search(r"notice\s*period|available\s*to\s*join|availability", field.get("label", ""), re.I):
+        if re.search(r"\bnotice\b|available\s*to\s*(?:join|start)|availability|when\s*(?:can|would).*?(?:join|start)", field.get("label", ""), re.I):
             days = answers.get("notice_period")
             if field.get("options"):
                 # Dropdown / radio: pick the option for the stated number of days, else leave it for the applicant.
@@ -693,7 +754,7 @@ async def set_field_value(frame, field: dict, value: str) -> None:
     if field.get("prompt"):
         # Workday multiselect prompt: type, Enter to search, pick the matching option.
         await _click(locator)
-        await locator.fill("")
+        await _fill_text(locator, "")
         await locator.press_sequentially(value, delay=40)
         await locator.press("Enter")
         await frame.wait_for_timeout(1500)
@@ -748,7 +809,7 @@ async def set_field_value(frame, field: dict, value: str) -> None:
         r"country(?:\s+code)?|dial(?:ing)?\s+code", field.get("label") or "", re.I
     ):
         await locator.click(timeout=5000)
-        await locator.fill("")
+        await _fill_text(locator, "")
         await locator.press_sequentially(value, delay=60)
         await frame.wait_for_timeout(1200)
         options = frame.locator(OPTION_SELECTOR)
@@ -760,7 +821,38 @@ async def set_field_value(frame, field: dict, value: str) -> None:
         await locator.press("ArrowDown")
         await locator.press("Enter")
         return
-    await locator.fill(value, timeout=5000)
+    await _fill_text(locator, value)
+
+
+async def _field_value_was_applied(frame, field: dict, value: str) -> bool:
+    """A slow custom picker can time out *after* it has committed the value.
+
+    Do not report that as a failed fill and leave an otherwise complete form in
+    review. We require either the requested option or a value changed from the
+    pre-fill snapshot, never merely any pre-existing value.
+    """
+    try:
+        key, kind, previous = field["key"], field.get("kind"), str(field.get("value") or "").strip()
+        if kind == "radio":
+            option = _match_option(field.get("options") or [], value)
+            if option is None:
+                return False
+            index = field["options"].index(option)
+            return await frame.locator(f'[data-fill-key="{key}"][data-fill-option="{index}"]').first.is_checked()
+        locator = frame.locator(f'[data-fill-key="{key}"]').first
+        if kind == "checkbox":
+            return await locator.is_checked() == (value.strip().lower() in ("yes", "true", "1", "checked", "y"))
+        if kind == "select":
+            current = (await locator.locator("option:checked").inner_text()).strip()
+        elif kind == "listbox":
+            current = (await locator.inner_text()).strip()
+        else:
+            current = (await locator.input_value()).strip()
+        if not current or re.match(r"^(select one|select|choose|--)$", current, re.I):
+            return False
+        return current != previous and bool(_match_option([current], value) or current.casefold() == value.strip().casefold())
+    except Exception:
+        return False
 
 
 async def fill_fields(frame, fields: list[dict], values: dict[str, str]) -> tuple[list[str], dict[str, str]]:
@@ -776,6 +868,14 @@ async def fill_fields(frame, fields: list[dict], values: dict[str, str]) -> tupl
             await set_field_value(frame, field, str(value))
             filled.append(key)
         except Exception as exc:
+            # Some searchable/listbox controls commit their selection then keep
+            # animating, causing Playwright's click/fill promise to time out.
+            # Read the real control before treating that as an application error.
+            await frame.wait_for_timeout(500)
+            if await _field_value_was_applied(frame, field, str(value)):
+                logger.info("Field %s (%s) was filled despite a delayed control response", key, field.get("label"))
+                filled.append(key)
+                continue
             logger.warning("Could not fill field %s (%s): %s", key, field.get("label"), exc)
             errors[key] = str(exc).splitlines()[0][:200]
     return filled, errors
@@ -839,6 +939,10 @@ async def upload_resume(frame, resume_key: str | None, username: str, root: str 
 def remember_answers(username: str, answers: list[tuple[str, str]]) -> None:
     """Append answers the user typed to details.md so the AI can reuse them next time (like apply.js)."""
     answers = [(label.strip(), value.strip()) for label, value in answers if label and label.strip() and value and value.strip()]
+    # Sites phrase this dozens of ways. Save one canonical line as well, so
+    # later forms can always recognize a notice-period answer.
+    answers = [("Notice period", value) if re.search(r"\bnotice\b|available\s*to\s*(?:join|start)|when\s*(?:can|would).*?(?:join|start)", label, re.I) else (label, value)
+               for label, value in answers]
     if not answers:
         return
     details = read_details_markdown(username) or ""

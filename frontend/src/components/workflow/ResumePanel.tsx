@@ -31,6 +31,7 @@ export function ResumePanel({ token, application, onUpdated, height = 420 }: {
   const [message, setMessage] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
   const decision = application.resume_agent ?? {};
   const currentKey = application.resume_key;
+  const attachedName = typeof application.form_data?.resume_uploaded === 'string' ? application.form_data.resume_uploaded : null;
 
   // Re-list when the chosen resume changes (the agent may just have generated one).
   useEffect(() => {
@@ -81,14 +82,25 @@ export function ResumePanel({ token, application, onUpdated, height = 420 }: {
         <FileText size={16} className="text-orange" />
         <span className="font-black text-ink">{current?.label ?? decision.chosen_label ?? application.resume_role ?? 'Resume'}</span>
         {current?.origin === 'generated' && <span className="inline-flex items-center gap-1 rounded-full bg-[#F4ECFF] px-2 py-0.5 text-[10px] font-black text-[#7A3FB8]"><Sparkles size={11} />Generated</span>}
+        {attachedName && <span className="rounded-full bg-[#E3F7D9] px-2 py-1 text-[10px] font-bold text-[#347233]">Used: {attachedName}</span>}
         {scoreOf[currentKey] != null && <span className="rounded-full bg-[#FFE4C8] px-2 py-0.5 text-[11px] font-black text-[#82512D]">{Number(scoreOf[currentKey]).toFixed(0)}% JD fit</span>}
         {decision.pinned && <span className="inline-flex items-center gap-1 rounded-full bg-[#E8F1FF] px-2 py-0.5 text-[10px] font-black text-[#2E6BB8]"><Pin size={11} />Picked by you</span>}
         {decision.status && !decision.pinned && <span className={`rounded-full px-2 py-0.5 text-[10px] font-black ${STATUS_TEXT[decision.status].tone}`}>{STATUS_TEXT[decision.status].label}</span>}
         {previewUrl && <a href={previewUrl} download={current?.upload_name ?? 'resume'} className="ml-auto inline-flex items-center gap-1 rounded-full bg-[#FFE4C8] px-3 py-1 text-xs font-bold text-[#82512D] hover:bg-[#FFD7AE]"><Download size={12} /> Download</a>}
       </div>
 
-      {current && Object.keys(current.portals).length > 0 && (
-        <p className="text-xs text-[#805940]">Already in your {Object.entries(current.portals).map(([portal, name]) => `${portal} account as “${name}”`).join(' and ')} — selected there instead of re-uploading.</p>
+      {current && (current.sources?.length ?? 0) > 0 && (
+        <div className="rounded-xl border border-[#EBCDAA] bg-white p-3">
+          <p className="text-[10px] font-black uppercase tracking-[.12em] text-[#A16A45]">Saved on job boards</p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {current.sources?.map(item => (
+              <span key={item.source} className="rounded-full bg-[#FFF0DE] px-2.5 py-1 text-xs font-bold text-[#82512D]">
+                {item.source === 'linkedin' ? 'LinkedIn' : 'Indeed'} · {item.display_name}
+              </span>
+            ))}
+          </div>
+          <p className="mt-2 text-[11px] text-[#805940]">Board-specific names are tracked separately, so Indeed and LinkedIn can show different filenames for this resume.</p>
+        </div>
       )}
 
       {(decision.candidates?.length ?? 0) > 0 && (

@@ -3,8 +3,10 @@ const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000/api/v1';
 export type User = { id: number; username: string; created_at: string; is_admin: boolean };
 export type AgentConfig = { match_scoring: { model: string }; system_prompt: string; can_edit_system_prompt: boolean };
 export type AuthResponse = { access_token: string; token_type: string; user: User };
-export type Job = { id?: number; source: string; external_url: string; title?: string; company?: string; location?: string; description?: string; date_posted?: string; ai_status: string; match_score?: number; ai_reason?: string; experience_match?: string; resume_category?: string | null };
-export type ApplicationJob = { id: number; source: string; external_url: string; title?: string; company?: string; location?: string; ai_status: string; match_score?: number };
+export type Job = { id?: number; source: string; external_url: string; title?: string; company?: string; location?: string; description?: string; date_posted?: string; scraped_at?: string | null; fetched_by_cron?: boolean; ai_status: string; match_score?: number; ai_reason?: string; experience_match?: string; resume_category?: string | null };
+export type JobPage = { items: Job[]; page: number; page_size: number; total: number; total_pages: number; tags: string[]; source_counts: Record<string, number> };
+export type JobSearchProgress = { type: 'job_search.progress'; run_id: number; stage: 'started' | 'fetching' | 'fetched' | 'scoring' | 'completed' | 'failed'; message: string; fetch_mode: 'manual' | 'cron'; data: Record<string, unknown> };
+export type ApplicationJob = { id: number; source: string; external_url: string; title?: string; company?: string; location?: string; ai_status: string; match_score?: number; fetched_by_cron?: boolean };
 export type Application = { id: number; job_id: number; resume_key: string; resume_role?: string | null; resume_agent?: ResumeAgentDecision; status: string; stage: string; queue_position: number; application_url?: string | null; form_data?: Record<string, unknown>; error?: string | null; created_at: string; updated_at: string; started_at?: string | null; applied_at?: string | null; completed_at?: string | null; llm_input_tokens?: number; llm_output_tokens?: number; llm_total_tokens?: number; llm_calls?: number; pending_question?: AgentQuestion | null; job: ApplicationJob };
 export type AgentQuestion = { id: string; question: string; reason?: string; options: { id: number; label: string; idx?: number }[] };
 export type BrowserFrame = { application_id: number; image: string | null; url?: string; title?: string; width?: number; height?: number; reason?: string };
@@ -30,8 +32,9 @@ export type ManualStatus = 'FAILED' | 'COMPLETED' | 'REJECTED';
 export type AgentPrompt = { key: string; title: string; description: string; variables: string[]; output: string; default: string; content: string; customized: boolean };
 export type AgentEventsResponse = { application_id: number; attempt: number; events: AgentEvent[] };
 // Resume agent: your resumes (uploaded + generated), its settings, and the per-application decision.
-export type ResumeInfo = { id: number; storage_key: string; role: string; category: string; file_name: string; label: string; origin: 'uploaded' | 'generated'; upload_name: string; parent_id?: number | null; source_job_id?: number | null; created_at?: string | null; portals: Record<string, string> };
+export type ResumeInfo = { id: number; storage_key: string; role: string; category: string; file_name: string; label: string; origin: 'uploaded' | 'generated'; upload_name: string; parent_id?: number | null; source_job_id?: number | null; created_at?: string | null; portals: Record<string, string>; sources: { source: 'linkedin' | 'indeed'; display_name: string; uploaded_at?: string | null; last_used_at?: string | null }[] };
 export type ResumeAgentSettings = { enabled: boolean; reuse_threshold: number; tailor_min: number; max_rounds: number; model: string };
+export type CronAgentSettings = { enabled: boolean; role: string; sources: ('linkedin' | 'indeed')[]; jobs_per_run: number; hours_old: number | null; interval_hours: number; scheduled_time: string; timezone: string; location: string; indeed_country: string | null; experience: string; last_run_at: string | null; last_error: string | null };
 export type ResumeCandidate = { resume_key: string; label: string; origin: string; score: number; matched: string[]; missing: string[]; reason: string };
 export type ResumeAgentStatus = 'reused' | 'generated' | 'low_fit' | 'tailor_no_gain';
 export type ResumeAgentDecision = { status?: ResumeAgentStatus; category?: string; candidates?: ResumeCandidate[]; jd_keywords?: string[]; base_key?: string; base_score?: number; chosen_key?: string; chosen_label?: string; chosen_score?: number; tailored_score?: number | null; keywords_added?: string[]; pinned?: boolean; thresholds?: { reuse: number; tailor_min: number } };
@@ -66,6 +69,14 @@ function applicationSocketUrl(token: string) {
   return url.toString();
 }
 
+function jobSearchSocketUrl(token: string) {
+  const url = new URL(API_URL);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  url.pathname = `${url.pathname.replace(/\/$/, '')}/jobs/ws`;
+  url.searchParams.set('token', token);
+  return url.toString();
+}
+
 export const api = {
   signup: (username: string, password: string) => request<AuthResponse>('/auth/signup', { method: 'POST', body: JSON.stringify({ username, password }) }),
   login: (username: string, password: string) => request<AuthResponse>('/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
@@ -91,8 +102,14 @@ export const api = {
   indeedSession: (token: string) => request<IndeedSession>('/indeed/session', {}, token),
   connectIndeed: (token: string) => request<IndeedSession>('/indeed/session/connect', { method: 'POST' }, token),
   disconnectIndeed: (token: string) => request<IndeedSession>('/indeed/session/disconnect', { method: 'POST' }, token),
-  searchJobs: (token: string, payload: Record<string, unknown>) => request<{ run_id: number; accepted_jobs: Job[]; rejected_jobs: Job[]; fetched_count: number; saved_count: number }>('/jobs/scrape', { method: 'POST', body: JSON.stringify(payload) }, token),
-  jobs: (token: string) => request<Job[]>('/jobs', {}, token),
+  searchJobs: (token: string, payload: Record<string, unknown>) => request<{ run_id: number; accepted_jobs: Job[]; rejected_jobs: Job[]; pending_jobs: Job[]; fetched_count: number; saved_count: number }>('/jobs/scrape', { method: 'POST', body: JSON.stringify(payload) }, token),
+  jobs: (token: string, params: Record<string, string | number | undefined> = {}) => {
+    const search = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => { if (value !== undefined && value !== '') search.set(key, String(value)); });
+    return request<JobPage>(`/jobs${search.size ? `?${search}` : ''}`, {}, token);
+  },
+  scoreJob: (token: string, jobId: number) => request<Job>(`/jobs/${jobId}/score`, { method: 'POST' }, token),
+  scoreJobs: (token: string, jobIds: number[]) => request<Job[]>('/jobs/score-pending', { method: 'POST', body: JSON.stringify({ job_ids: jobIds }) }, token),
   applyJobs: (token: string, payload: { job_ids: number[]; resume_key?: string | null }) => request<ApplicationQueueResponse>('/applications/apply', { method: 'POST', body: JSON.stringify(payload) }, token),
   applications: (token: string) => request<Application[]>('/applications', {}, token),
   fillApplicationFields: (token: string, applicationId: number, values: Record<string, string>, remember: boolean) => request<Application>(`/applications/${applicationId}/fields`, { method: 'POST', body: JSON.stringify({ values, remember }) }, token),
@@ -108,11 +125,16 @@ export const api = {
   switchResume: (token: string, applicationId: number, resumeKey: string) => request<{ application: Application; result: ResumeSwitchResult }>(`/applications/${applicationId}/resume`, { method: 'POST', body: JSON.stringify({ resume_key: resumeKey }) }, token),
   resumeAgent: (token: string) => request<ResumeAgentSettings>('/agent-config/resume-agent', {}, token),
   saveResumeAgent: (token: string, settings: ResumeAgentSettings) => request<ResumeAgentSettings>('/agent-config/resume-agent', { method: 'PUT', body: JSON.stringify(settings) }, token),
+  autoSubmit: (token: string) => request<{ enabled: boolean }>('/agent-config/auto-submit', {}, token),
+  saveAutoSubmit: (token: string, enabled: boolean) => request<{ enabled: boolean }>('/agent-config/auto-submit', { method: 'PUT', body: JSON.stringify({ enabled }) }, token),
+  cronAgent: (token: string) => request<CronAgentSettings>('/agent-config/cron-agent', {}, token),
+  saveCronAgent: (token: string, settings: CronAgentSettings) => request<CronAgentSettings>('/agent-config/cron-agent', { method: 'PUT', body: JSON.stringify(settings) }, token),
   agentPrompts: (token: string) => request<AgentPrompt[]>('/agent-config/prompts', {}, token),
   saveAgentPrompt: (token: string, key: string, content: string) => request<AgentPrompt[]>(`/agent-config/prompts/${key}`, { method: 'PUT', body: JSON.stringify({ content }) }, token),
   resetAgentPrompt: (token: string, key: string) => request<AgentPrompt[]>(`/agent-config/prompts/${key}`, { method: 'DELETE' }, token),
   applicationEvents: (token: string, applicationId: number) => request<AgentEventsResponse>(`/applications/${applicationId}/events`, {}, token),
   applicationSocketUrl,
+  jobSearchSocketUrl,
   agentConfig: (token: string) => request<AgentConfig>('/agent-config', {}, token),
   saveAgentConfig: (token: string, model: string) => request<AgentConfig>('/agent-config', { method: 'PUT', body: JSON.stringify({ match_scoring: { model } }) }, token),
   saveSystemPrompt: (token: string, content: string) => request<AgentConfig>('/agent-config/system-prompt', { method: 'PUT', body: JSON.stringify({ content }) }, token),

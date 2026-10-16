@@ -138,7 +138,7 @@ export function ApplicationFormPanel({ token, application, onUpdated }: { token:
               <div className="mb-2 flex items-start gap-2">
                 <p className="flex-1 text-sm font-bold text-[#542914]">
                   {field.group && <span className="block text-[11px] font-normal text-[#805940]">{field.group}</span>}
-                  {field.label}{field.required && !/\*\s*$/.test(field.label) && <span className="text-[#AD3212]"> *</span>}
+                  {field.label || field.name || (field.kind === 'radio' || field.kind === 'checkbox' ? 'Choose an option' : 'Application question')}{field.required && !/\*\s*$/.test(field.label) && <span className="text-[#AD3212]"> *</span>}
                 </p>
                 {isChanged ? <span className="rounded-full bg-[#FFF0DE] px-2 py-0.5 text-[10px] font-black text-[#92502A]"><PencilLine size={10} className="mr-1 inline" />edited</span>
                   : badge && BadgeIcon ? <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-black ${badge.className}`}><BadgeIcon size={10} />{badge.label}</span>
