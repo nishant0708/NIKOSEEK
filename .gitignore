@@ -53,3 +53,13 @@ Thumbs.db
 logs/
 # Persistent per-user browser profiles (LinkedIn session cookies)
 backend/.browser_profiles/
+.agents/*
+brag*
+deploy/
+node_modules/demo-video.env
+node_modules
+demo-video/
+demo-video.env
+package-lock.json
+package.json
+skills-lock.json
