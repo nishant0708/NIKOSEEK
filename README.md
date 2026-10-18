@@ -22,9 +22,10 @@ An AI multi-agent platform that searches LinkedIn and Indeed, scores every job a
 
 <div align="center">
 
-https://github.com/user-attachments/assets/ac2034c4-fcfc-43d8-8821-3d1a0a905682
 
-▶️ **[Watch the 90-second demo on YouTube](YOUTUBE_URL)**
+https://github.com/user-attachments/assets/12446d92-ca0c-4794-bd48-20d125d033ce
+
+▶️ **[Watch the 2-minutes demo on Github](https://github.com/nishant0708/NIKOSEEK/blob/main/docs/media/nikoseek-full-demo.mp4)**
 
 </div>
 
