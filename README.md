@@ -17,16 +17,11 @@ An AI multi-agent platform that searches LinkedIn and Indeed, scores every job a
 
 ## 🎥 Demo
 
-<!-- 👇 Replace the line below with the github.com/user-attachments/assets/... link you get by
-     dragging docs/media/nikoseek-demo.mp4 into this README in GitHub's web editor.
-     A bare user-attachments link on its own line renders as an inline video player. -->
-PASTE_VIDEO_LINK_HERE
-
 <div align="center">
 
-[![NikoSeek demo: the resume agent tailors a resume from 62 to 85 JD match](docs/media/demo-thumbnail.jpg)](https://github.com/nishant0708/NIKOSEEK/blob/main/docs/media/nikoseek-demo.mp4)
+[![Watch the NikoSeek demo on YouTube](docs/media/demo-thumbnail.jpg)](YOUTUBE_URL)
 
-▶️ **[Watch the 90-second demo](https://github.com/nishant0708/NIKOSEEK/blob/main/docs/media/nikoseek-demo.mp4)**
+▶️ **[Watch the 90-second demo on YouTube](YOUTUBE_URL)**
 
 </div>
 
