@@ -1,17 +1,8 @@
 <div align="center">
 
-# 🧡 NikoSeek
+<img src="docs/media/banner.png" alt="NikoSeek: Your job applications, on autopilot. Find. Score. Apply." width="100%" />
 
-### Your job applications, on autopilot.
-
-**Find. Score. Apply.** An AI multi-agent platform that searches LinkedIn and Indeed, scores every job against your profile, tailors your resume per job description, and fills applications in a real browser, while keeping you in the loop.
-
-[![Watch the demo](docs/media/demo-thumbnail.jpg)](docs/media/nikoseek-demo.mp4)
-
-▶️ **[Watch the 90-second demo](docs/media/nikoseek-demo.mp4)**
-
-<!-- For an inline player on GitHub: edit this README on github.com, drag docs/media/nikoseek-demo.mp4
-     into the editor, and paste the generated https://github.com/user-attachments/... link on its own line here. -->
+An AI multi-agent platform that searches LinkedIn and Indeed, scores every job against your profile, tailors your resume per job description, and fills applications in a real browser, while keeping you in the loop.
 
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
@@ -24,8 +15,26 @@
 
 ---
 
+## 🎥 Demo
+
+<!-- 👇 Replace the line below with the github.com/user-attachments/assets/... link you get by
+     dragging docs/media/nikoseek-demo.mp4 into this README in GitHub's web editor.
+     A bare user-attachments link on its own line renders as an inline video player. -->
+PASTE_VIDEO_LINK_HERE
+
+<div align="center">
+
+[![NikoSeek demo: the resume agent tailors a resume from 62 to 85 JD match](docs/media/demo-thumbnail.jpg)](https://github.com/nishant0708/NIKOSEEK/blob/main/docs/media/nikoseek-demo.mp4)
+
+▶️ **[Watch the 90-second demo](https://github.com/nishant0708/NIKOSEEK/blob/main/docs/media/nikoseek-demo.mp4)**
+
+</div>
+
+---
+
 ## 📑 Contents
 
+- [Demo](#-demo)
 - [Features](#-features)
 - [Screenshots](#-screenshots)
 - [How it works](#-how-it-works)
