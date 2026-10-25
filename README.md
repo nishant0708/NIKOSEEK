@@ -1,15 +1,17 @@
 <div align="center">
 
-<img src="docs/media/banner.png" alt="NikoSeek: Your job applications, on autopilot. Find. Score. Apply." width="100%" />
+<img src="docs/media/logo.png" alt="NikoSeek: Your job applications, on autopilot. Find. Score. Apply." width="40%" />
 
 An AI multi-agent platform that searches LinkedIn and Indeed, scores every job against your profile, tailors your resume per job description, and fills applications in a real browser, while keeping you in the loop.
 
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
 ![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
+![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=blue)
 ![Playwright](https://img.shields.io/badge/Playwright-2EAD33?logo=playwright&logoColor=white)
 ![Gemini](https://img.shields.io/badge/Gemini-Vertex%20AI-4285F4?logo=googlegemini&logoColor=white)
 ![Supabase](https://img.shields.io/badge/Supabase-3FCF8E?logo=supabase&logoColor=white)
+![GitHub Stars](https://img.shields.io/github/stars/nishant0708/NIKOSEEK)
 
 </div>
 
@@ -17,11 +19,13 @@ An AI multi-agent platform that searches LinkedIn and Indeed, scores every job a
 
 ## 🎥 Demo
 
+
 <div align="center">
 
-[![Watch the NikoSeek demo on YouTube](docs/media/demo-thumbnail.jpg)](YOUTUBE_URL)
 
-▶️ **[Watch the 90-second demo on YouTube](YOUTUBE_URL)**
+https://github.com/user-attachments/assets/12446d92-ca0c-4794-bd48-20d125d033ce
+
+▶️ **[Watch the 2-minutes demo on Github](https://github.com/nishant0708/NIKOSEEK/blob/main/docs/media/nikoseek-full-demo.mp4)**
 
 </div>
 
