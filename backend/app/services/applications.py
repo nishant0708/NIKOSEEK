@@ -41,6 +41,7 @@ from app.services.llm import LLMUnavailableError
 from app.services.live_view import live_view
 from app.services.form_filler import remember_answers, remember_notes
 from app.services.form_session import FormSession, form_sessions
+from app.services.job_from_url import create_manual_job, fill_job_basics, find_existing_job, parse_job_url, prefetch_job_details
 from app.services.job_navigator import navigate_to_form, normalize_job_url
 from app.services.linkedin_browser import (
     READY,
@@ -234,6 +235,14 @@ def linkedin_connected(db: Session, user: User) -> bool:
     return get_browser_session(db, user, LINKEDIN).status == READY
 
 
+def source_connection_error(db: Session, user: User, sources: set[str]) -> str | None:
+    if LINKEDIN in sources and not linkedin_connected(db, user):
+        return "LINKEDIN_NOT_CONNECTED"
+    if INDEED in sources and get_browser_session(db, user, INDEED).status != READY:
+        return "INDEED_NOT_CONNECTED"
+    return None
+
+
 def application_connection_error(db: Session, user: User, job_ids: list[int]) -> str | None:
     """Return the provider-specific login requirement for the selected jobs."""
     sources = {
@@ -241,11 +250,37 @@ def application_connection_error(db: Session, user: User, job_ids: list[int]) ->
         for (source,) in db.query(ScrapedJob.source)
         .filter(ScrapedJob.user_id == user.id, ScrapedJob.id.in_(job_ids)).all()
     }
-    if LINKEDIN in sources and not linkedin_connected(db, user):
-        return "LINKEDIN_NOT_CONNECTED"
-    if INDEED in sources and get_browser_session(db, user, INDEED).status != READY:
-        return "INDEED_NOT_CONNECTED"
-    return None
+    return source_connection_error(db, user, sources)
+
+
+ACTIVE_STATUSES = {"PENDING", "IN_PROGRESS", "HUMAN_REVIEW_REQUIRED"}
+DONE_STATUSES = {SUBMITTED, "COMPLETED"}
+
+
+class JobUrlConflict(ValueError):
+    pass
+
+
+def queue_job_from_url(db: Session, user: User, url: str) -> list[Application]:
+    """Queue a LinkedIn / Indeed posting you found yourself. Skips match scoring; everything after the queue is unchanged.
+
+    Raises JobUrlError (bad URL), JobUrlConflict (already queued / applied) or ValueError("…_NOT_CONNECTED")."""
+    source, canonical, key = parse_job_url(url)
+    connection_error = source_connection_error(db, user, {source})
+    if connection_error:
+        raise ValueError(connection_error)
+    job = find_existing_job(db, user, source, key)
+    if job is not None:
+        application = db.query(Application).filter(Application.user_id == user.id, Application.job_id == job.id).one_or_none()
+        if application is not None and application.status in ACTIVE_STATUSES:
+            raise JobUrlConflict("This job is already in your queue. Open Live workflow to follow it.")
+        if application is not None and application.status in DONE_STATUSES:
+            raise JobUrlConflict("You've already applied to this job.")
+    else:
+        job = create_manual_job(db, user, source, canonical)
+    if (not job.title or not job.company) and prefetch_job_details(job):
+        db.commit()
+    return enqueue_applications(db, user, [job.id], None)
 
 
 def enqueue_applications(db: Session, user: User, job_ids: list[int], resume_key: str | None) -> list[Application]:
@@ -388,6 +423,18 @@ async def _run_pipeline(run: _Run, user: User) -> None:
         await page.goto(job_url, wait_until="domcontentloaded", timeout=60_000)
         log.track(page)
         await run.log("action", f"Reopened Indeed job in a fresh tab: {page.url}", data={"url": page.url, "job_url": job_url}, stage_key="login")
+
+    # 2a. A job you added by URL has no title / company yet: read them off the posting
+    #     (the wrong-tab guard and the form prompts need them).
+    if not job.title or not job.company:
+        try:
+            if await fill_job_basics(page, job):
+                db.commit()
+                await log("info", f"Read the job from the posting: {job.title or 'untitled'} at {job.company or 'unknown company'}.")
+                await run.publish()
+        except Exception:
+            logger.exception("Could not read job details for application %s", application.id)
+            db.rollback()
 
     # 2b. Resume agent (Workflow page toggle): score your resumes against this JD, tailor one if it's worth it.
     #     Runs on the open posting so a missing JD (older LinkedIn searches) can be read from the page.

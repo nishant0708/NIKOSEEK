@@ -181,10 +181,11 @@ function QueueGroup({ title, applications, selectedId, onSelect, alert }: {
                 className={`flex w-full items-start gap-2 rounded-xl px-2.5 py-2 text-left transition ${active ? 'bg-[#FFF0DE] ring-1 ring-orange' : 'hover:bg-[#FFF9F0]'}`}>
                 <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full" style={{ background: STATUS_DOT[application.status] ?? '#C9A27E' }} />
                 <span className="min-w-0 flex-1">
-                  <span className="block truncate text-[13px] font-bold text-ink">{application.job.title ?? 'Untitled job'}</span>
+                  <span className="block truncate text-[13px] font-bold text-ink">{application.job.title ?? (application.job.ai_status === 'MANUAL' ? 'Job from URL' : 'Untitled job')}</span>
                   <span className="block truncate text-[11px] text-[#805940]">{application.job.company} · {timeAgo(application.created_at)}</span>
                 </span>
                 {application.job.fetched_by_cron && <span className="shrink-0 rounded-full bg-[#F0E7FF] px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide text-[#7541AE]">Cron</span>}
+                {application.job.ai_status === 'MANUAL' && <span className="shrink-0 rounded-full bg-[#E8F1FF] px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide text-[#2D61B8]">URL</span>}
                 {application.pending_question && <Bell size={13} className="mt-1 shrink-0 text-[#E2711D]" />}
               </button>
             );
@@ -577,7 +578,7 @@ export function LiveWorkflow({ token }: { token: string }) {
                   <div className="flex flex-wrap items-start gap-3">
                     <div className="min-w-0 flex-1">
                       <p className="text-[11px] font-black uppercase tracking-[.14em] text-orange">{following ? 'Following the live job' : 'Selected job'}</p>
-                      <h1 className="mt-1 truncate text-2xl font-black text-ink">{job?.title ?? 'Untitled job'}</h1>
+                      <h1 className="mt-1 truncate text-2xl font-black text-ink">{job?.title ?? (job?.ai_status === 'MANUAL' ? 'Job from URL' : 'Untitled job')}</h1>
                       <p className="mt-0.5 text-sm text-[#805940]">{job?.company} · {job?.location}</p>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
@@ -603,7 +604,7 @@ export function LiveWorkflow({ token }: { token: string }) {
                       <Detail label="Company">{job?.company ?? '—'}</Detail>
                       <Detail label="Location">{job?.location ?? '—'}</Detail>
                       <Detail label="Job board">{job?.source ?? '—'}</Detail>
-                      <Detail label="Match">{job?.match_score != null ? `${job.match_score.toFixed(0)}% · ${job.ai_status.toLowerCase()}` : '—'}</Detail>
+                      <Detail label="Match">{job?.ai_status === 'MANUAL' ? 'Added by URL · not scored' : job?.match_score != null ? `${job.match_score.toFixed(0)}% · ${job.ai_status.toLowerCase()}` : '—'}</Detail>
                       <Detail label="Resume used">{selectedApp.resume_agent?.chosen_label ?? selectedApp.resume_role ?? '—'}</Detail>
                       <Detail label="Queue">#{selectedApp.queue_position}</Detail>
                       <Detail label="Queued">{fmtDate(selectedApp.created_at)}</Detail>

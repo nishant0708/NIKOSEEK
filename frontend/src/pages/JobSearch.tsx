@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
-import { BriefcaseBusiness, CheckSquare, ExternalLink, Filter, Globe, Layers, LoaderCircle, Search, Sparkles, Square } from 'lucide-react';
+import { BriefcaseBusiness, CheckSquare, ExternalLink, Filter, Globe, Layers, Link2, LoaderCircle, Search, Sparkles, Square } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { api, INDEED_NOT_CONNECTED, LINKEDIN_NOT_CONNECTED, type Job, type JobPage, type JobSearchProgress } from '../lib/api';
 
-type View = 'all' | 'linkedin' | 'indeed' | 'search';
+type View = 'all' | 'linkedin' | 'indeed' | 'search' | 'url';
 type Verdict = 'accepted' | 'rejected' | 'pending';
 
 function jobKey(job: Job) {
@@ -106,6 +106,8 @@ export function JobSearch({ token }: { token: string }) {
   const [selectedJobs, setSelectedJobs] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [applyBusy, setApplyBusy] = useState(false);
+  const [jobUrl, setJobUrl] = useState('');
+  const [urlBusy, setUrlBusy] = useState(false);
   const [scoringJobId, setScoringJobId] = useState<number | null>(null);
   const [error, setError] = useState('');
   const [searchStatus, setSearchStatus] = useState('');
@@ -132,7 +134,7 @@ export function JobSearch({ token }: { token: string }) {
     let active = true;
     setLoadingJobs(true);
     api.jobs(token, {
-      page, page_size: 12, source: view === 'all' || view === 'search' ? undefined : view,
+      page, page_size: 12, source: view === 'all' || view === 'search' || view === 'url' ? undefined : view,
       status_filter: verdict.toUpperCase(), q: filter.trim() || undefined, tag: tag || undefined, sort,
       run_id: view === 'search' ? lastSearch?.runId : undefined,
     }).then(result => { if (active) setJobPage(result); })
@@ -206,6 +208,25 @@ export function JobSearch({ token }: { token: string }) {
     }
   }
 
+  // A posting you found yourself: straight to the apply queue, no match scoring.
+  async function queueFromUrl(event: FormEvent) {
+    event.preventDefault();
+    if (!jobUrl.trim()) return;
+    setUrlBusy(true);
+    setError('');
+    try {
+      await api.applyFromUrl(token, jobUrl.trim());
+      setJobUrl('');
+      navigate('/workflow/live');
+    } catch (e) {
+      if (e instanceof Error && e.message === LINKEDIN_NOT_CONNECTED) { navigate('/connect-linkedin'); return; }
+      if (e instanceof Error && e.message === INDEED_NOT_CONNECTED) { navigate('/connect-indeed'); return; }
+      setError(e instanceof Error ? e.message : 'Could not queue that job.');
+    } finally {
+      setUrlBusy(false);
+    }
+  }
+
   async function scoreJob(job: Job) {
     if (typeof job.id !== 'number') return;
     setScoringJobId(job.id);
@@ -238,7 +259,7 @@ export function JobSearch({ token }: { token: string }) {
     }
   }
 
-  const title = { all: 'All jobs', linkedin: 'LinkedIn jobs', indeed: 'Indeed jobs', search: 'Search' }[view];
+  const title = { all: 'All jobs', linkedin: 'LinkedIn jobs', indeed: 'Indeed jobs', search: 'Search', url: 'Add a job by URL' }[view];
 
   return (
     <main className="min-h-screen bg-cream px-5 py-7">
@@ -251,6 +272,7 @@ export function JobSearch({ token }: { token: string }) {
               <SideItem active={view === 'linkedin'} icon={<Globe size={16} />} label="LinkedIn jobs" count={counts.linkedin} onClick={() => setView('linkedin')} />
               <SideItem active={view === 'indeed'} icon={<BriefcaseBusiness size={16} />} label="Indeed jobs" count={counts.indeed} onClick={() => setView('indeed')} />
               <SideItem active={view === 'search'} icon={<Search size={16} />} label="Search" count={view === 'search' ? jobPage?.total : undefined} onClick={() => setView('search')} />
+              <SideItem active={view === 'url'} icon={<Link2 size={16} />} label="Add by URL" onClick={() => setView('url')} />
             </div>
           </div>
         </aside>
@@ -311,6 +333,22 @@ export function JobSearch({ token }: { token: string }) {
             </form>
           )}
 
+          {view === 'url' && (
+            <form onSubmit={queueFromUrl} className="mt-5 rounded-[1.75rem] border border-[#EBCDAA] bg-[#FFF9F0] p-5">
+              <div className="flex items-center gap-2 text-sm font-black text-ink"><Link2 size={16} className="text-orange" /> Apply to a job you found yourself</div>
+              <p className="mt-1 text-xs text-[#805940]">Paste a LinkedIn or Indeed job URL. It goes straight to the apply queue: AI match scoring is skipped, everything else (resume agent, apply agent, your review) runs as usual.</p>
+              <label className="mt-4 block text-xs font-black uppercase tracking-[.12em] text-[#82512D]">Job URL
+                <Input required type="text" inputMode="url" value={jobUrl} onChange={e => setJobUrl(e.target.value)}
+                  placeholder="https://www.linkedin.com/jobs/view/4470153536/" className="mt-2 bg-white normal-case tracking-normal" />
+              </label>
+              <p className="mt-2 text-xs text-[#805940]">Works with linkedin.com/jobs/view/… , a LinkedIn search link with currentJobId=…, or an Indeed link with jk=… .</p>
+              <Button className="mt-5 w-full" disabled={urlBusy || !jobUrl.trim()}>
+                {urlBusy ? <LoaderCircle className="animate-spin" /> : <Link2 size={18} />}
+                {urlBusy ? 'Adding to the queue…' : 'Add to apply queue'}
+              </Button>
+            </form>
+          )}
+
           {error && <p className="mt-4 rounded-xl bg-[#FFE1D6] p-4 font-bold text-[#AD3212]">{error}</p>}
           {busy && (
             <div className="mt-4 rounded-xl border border-[#EBCDAA] bg-[#FFF0DE] px-4 py-3 text-sm font-bold text-[#92502A]" aria-live="polite">
@@ -321,7 +359,7 @@ export function JobSearch({ token }: { token: string }) {
             </div>
           )}
 
-          {view === 'search' && !lastSearch ? (
+          {view === 'url' ? null : view === 'search' && !lastSearch ? (
             <p className="mt-5 rounded-2xl bg-[#FFF9F0] p-6 text-sm font-bold text-[#805940]">Results of your search show up here (and in All jobs).</p>
           ) : (
             <>

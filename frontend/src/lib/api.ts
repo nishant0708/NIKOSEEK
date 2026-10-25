@@ -111,6 +111,7 @@ export const api = {
   scoreJob: (token: string, jobId: number) => request<Job>(`/jobs/${jobId}/score`, { method: 'POST' }, token),
   scoreJobs: (token: string, jobIds: number[]) => request<Job[]>('/jobs/score-pending', { method: 'POST', body: JSON.stringify({ job_ids: jobIds }) }, token),
   applyJobs: (token: string, payload: { job_ids: number[]; resume_key?: string | null }) => request<ApplicationQueueResponse>('/applications/apply', { method: 'POST', body: JSON.stringify(payload) }, token),
+  applyFromUrl: (token: string, url: string) => request<ApplicationQueueResponse>('/applications/from-url', { method: 'POST', body: JSON.stringify({ url }) }, token),
   applications: (token: string) => request<Application[]>('/applications', {}, token),
   fillApplicationFields: (token: string, applicationId: number, values: Record<string, string>, remember: boolean) => request<Application>(`/applications/${applicationId}/fields`, { method: 'POST', body: JSON.stringify({ values, remember }) }, token),
   continueApplication: (token: string, applicationId: number) => request<Application>(`/applications/${applicationId}/continue`, { method: 'POST' }, token),

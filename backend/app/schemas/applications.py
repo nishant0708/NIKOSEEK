@@ -46,6 +46,10 @@ class ApplicationQueueRequest(BaseModel):
     resume_key: str | None = Field(default=None, max_length=1000)
 
 
+class ApplicationFromUrlRequest(BaseModel):
+    url: str = Field(min_length=8, max_length=2000)
+
+
 class ApplicationResumeSwitch(BaseModel):
     resume_key: str = Field(min_length=3, max_length=1000)
 
