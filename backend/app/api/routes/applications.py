@@ -10,12 +10,13 @@ from sqlalchemy.orm import joinedload
 from app.api.deps import CurrentUser, DbSession
 from app.core.config import settings
 from app.db.models import Application, User
-from app.schemas.applications import ApplicationAnswer, ApplicationFieldValues, ApplicationInstruction, ApplicationResumeSwitch, ApplicationStatusUpdate, BrowserInput, ApplicationQueueRequest, ApplicationQueueResponse, ApplicationRead
+from app.schemas.applications import ApplicationAnswer, ApplicationFieldValues, ApplicationFromUrlRequest,ApplicationInstruction, ApplicationResumeSwitch, ApplicationStatusUpdate, BrowserInput, ApplicationQueueRequest, ApplicationQueueResponse, ApplicationRead
 from app.services.agent_log import list_events, serialize_event
 from app.services.applications import (
-    FormActionError, answer_question, application_connection_error, continue_form, enqueue_applications, fill_from_user, instruct_form, recheck_form,
-    serialize_application, set_application_status, submit_form, switch_resume,
+    FormActionError, JobUrlConflict, answer_question, application_connection_error, continue_form, enqueue_applications, fill_from_user, instruct_form,
+    queue_job_from_url, recheck_form, serialize_application, set_application_status, submit_form, switch_resume,
 )
+from app.services.job_from_url import JobUrlError
 from app.services.live_view import live_view
 from app.db.session import SessionLocal
 from app.ws.broker import broker
@@ -156,6 +157,27 @@ async def apply_jobs(payload: ApplicationQueueRequest, user: CurrentUser, db: Db
     for application in applications:
         queue.put_nowait((user.id, application.id, 0.0))
     return ApplicationQueueResponse(message="Applications queued", applications=[_serialize(application) for application in applications])
+
+
+@router.post("/from-url", response_model=ApplicationQueueResponse)
+async def apply_from_url(payload: ApplicationFromUrlRequest, user: CurrentUser, db: DbSession, request: Request) -> ApplicationQueueResponse:
+    """Queue a LinkedIn / Indeed posting you found yourself. Match scoring is skipped; the rest of the pipeline is the same."""
+    try:
+        applications = queue_job_from_url(db, user, payload.url)
+    except JobUrlError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    except JobUrlConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except ValueError as exc:
+        detail = str(exc)
+        if detail.endswith("_NOT_CONNECTED"):
+            raise HTTPException(status_code=status.HTTP_428_PRECONDITION_REQUIRED, detail=detail) from exc
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail) from exc
+
+    queue: asyncio.Queue[tuple[int, int, float]] = request.app.state.application_queue
+    for application in applications:
+        queue.put_nowait((user.id, application.id, 0.0))
+    return ApplicationQueueResponse(message="Job queued", applications=[_serialize(application) for application in applications])
 
 
 @router.websocket("/ws")

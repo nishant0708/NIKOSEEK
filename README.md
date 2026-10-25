@@ -52,6 +52,7 @@ An AI multi-agent platform that searches LinkedIn and Indeed, scores every job a
 | 📄 | **Resume → AI profile** | Upload a PDF or DOCX once. An LLM extracts a private `details.md` and writes an editable `profile.md` that every agent reads from. |
 | 🔗 | **Connect once** | Sign in to LinkedIn and Indeed a single time (2FA and passkeys supported) and save one email and password for company portals like Workday. Sessions are reused for every application. |
 | 🔍 | **Manual search** | Search LinkedIn and Indeed by role, location, experience, salary and posting date. |
+| 🔗 | **Add by URL** | Found a job yourself? Paste its LinkedIn or Indeed URL and it goes straight to the apply queue. AI match scoring is skipped; the resume agent, apply agent and your review run as usual. |
 | ⏰ | **Scheduled agent** | Turn on the ambient agent to search every 6, 12, 24 or 48 hours and queue good matches automatically. |
 | 🎯 | **AI match scoring** | Gemini scores every job from 0 to 100 against your profile, explains why, and sorts results into Accepted and Rejected. |
 | 📝 | **Resume agent** | Compares each job description with your resumes. Reuses the best one, or writes a tailored resume when the fit is low (for example 62 → 85). |
@@ -88,6 +89,7 @@ flowchart LR
     C -->|Scheduled agent| D
     D --> E[🎯 Gemini match score 0-100]
     E -->|Accepted| F[📥 Application queue]
+    U[🔗 Paste a job URL] -->|skips scoring| F
     F --> G[📝 Resume agent<br/>reuse or tailor]
     G --> H[🤖 Apply agent<br/>Playwright + real Chrome]
     H --> I{Needs input?}
@@ -97,7 +99,7 @@ flowchart LR
 ```
 
 1. **Profile.** Your resume is stored in a private Supabase Storage bucket. The LLM writes `Profile/details.md` and an editable `Profile/profile.md`.
-2. **Discovery.** [JobSpy](https://pypi.org/project/python-jobspy/) scrapes LinkedIn and Indeed, either from a manual search or from the scheduled agent.
+2. **Discovery.** [JobSpy](https://pypi.org/project/python-jobspy/) scrapes LinkedIn and Indeed, either from a manual search or from the scheduled agent. Jobs you paste by URL skip discovery and scoring and go straight to the queue; their title, company and description are read from the posting when the agent opens it.
 3. **Scoring.** Gemini (via Vertex AI, with an optional Groq fallback) returns `match_score`, `ai_reason` and `experience_match` for every job.
 4. **Resume agent.** Each job is classified into a category. Your resumes in that category are scored against the JD, then the best one is reused or a tailored one is generated and saved.
 5. **Apply agent.** One long-lived, headed Chrome per user reuses your LinkedIn and Indeed sessions. The navigator finds the apply path, the form filler tags fields and fills them from your profile, and anything missing is asked of you.
@@ -233,7 +235,7 @@ Frontend: `VITE_API_URL` (optional) overrides the API base URL.
 1. **📄 Onboard.** Sign up, upload your resume, add a target role, extra projects and achievements, then click **Generate my profile**.
 2. **✍️ Review your profile.** Edit the Markdown on the left and check the live preview on the right.
 3. **🔗 Connect accounts.** On the Profile page, connect **LinkedIn** and **Indeed** once (a real Chrome window opens for you to sign in), and save an email and password for **company job portals**.
-4. **🔍 Find jobs.** Use **Jobs → Search**, or enable the **Ambient job agent** in **Config workflow** to search on a schedule.
+4. **🔍 Find jobs.** Use **Jobs → Search**, paste a posting you found in **Jobs → Add by URL**, or enable the **Ambient job agent** in **Config workflow** to search on a schedule.
 5. **🎯 Review matches.** Filter and sort the **Accepted** list by match score, tag, source or date.
 6. **📥 Queue.** Select jobs and click **Apply selected**.
 7. **📺 Watch it work.** Open **Live workflow** to follow the flow diagram, agent log, resume choice and live browser for each application.
@@ -251,7 +253,7 @@ All routes are under `/api/v1`. Everything except signup and login needs `Author
 | 📄 Profile | `GET`/`PUT /profile`, `POST /profile/generate`, `POST /profile/upload`, `GET`/`PUT /profile/linkedin`, `/profile/indeed`, `/profile/ats` |
 | 📎 Resumes | `GET /resumes`, `POST /resumes`, `GET /resumes/status`, `GET /resumes/file` |
 | 🔍 Jobs | `POST /jobs/scrape`, `GET /jobs`, `POST /jobs/{id}/score`, `POST /jobs/score-pending`, `GET /jobs/runs` |
-| 🤖 Applications | `POST /applications/apply`, `GET /applications`, `GET /applications/{id}/events`, `POST /applications/{id}/answer`, `/instruct`, `/continue`, `/submit`, `/status`, `/recheck`, `/resume`, `/browser/input` |
+| 🤖 Applications | `POST /applications/apply`, `POST /applications/from-url`, `GET /applications`, `GET /applications/{id}/events`, `POST /applications/{id}/answer`, `/instruct`, `/continue`, `/submit`, `/status`, `/recheck`, `/resume`, `/browser/input` |
 | ⚙️ Agent config | `/agent-config` (scoring model, prompts, scheduled agent, resume agent, auto-submit) |
 | 🔗 Sessions | `/linkedin`, `/indeed` (connect, check and disconnect the browser sessions) |
 | 📡 Realtime | `WS /applications/ws?token=…` (application events and live browser frames) |

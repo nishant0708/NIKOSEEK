@@ -36,6 +36,7 @@ const PITCH = 440;         // column pitch
 const ROWS = [0, 340, 720, 1040, 1360, 1640]; // row tops
 const COLX = (c: number) => c * PITCH;
 const CY = (r: number) => ROWS[r] + NH / 2;   // vertical centre of a row
+const URL_Y = -230;        // "Paste a job URL" sits above Match scoring, inside group 1
 
 type ToggleKey = 'resume' | 'auto_submit' | 'cron';
 type CardData = { title: string; detail: string; tone: Tone; icon: string; promptKey?: string; toggle?: ToggleKey; badge?: string; badgeOn?: boolean; dimmed?: boolean };
@@ -167,8 +168,8 @@ function card(id: string, col: number, row: number, icon: string, title: string,
   };
 }
 
-function groupNode(id: string, c0: number, c1: number, r0: number, r1: number, title: string, bg: string, border: string, color: string): Node {
-  const x = COLX(c0) - 24, y = ROWS[r0] - 56;
+function groupNode(id: string, c0: number, c1: number, r0: number, r1: number, title: string, bg: string, border: string, color: string, top?: number): Node {
+  const x = COLX(c0) - 24, y = (top ?? ROWS[r0]) - 56;
   const w = COLX(c1) + NW + 24 - x, h = ROWS[r1] + NH + 26 - y;
   const data: GroupData = { title, bg, border, color, w, h };
   return {
@@ -180,7 +181,7 @@ function groupNode(id: string, c0: number, c1: number, r0: number, r1: number, t
 function buildNodes(model: string, resumeOn = false, autoSubmitOn = false, cronOn = false, cronRole = ''): Node[] {
   const off = !resumeOn;
   return [
-    groupNode('g1', 0, 6, 0, 0, '1  DISCOVER, SCORE & OPEN THE JOB', '#FFF3DC', '#F1D08A', '#A8691A'),
+    groupNode('g1', 0, 6, 0, 0, '1  DISCOVER, SCORE & OPEN THE JOB', '#FFF3DC', '#F1D08A', '#A8691A', URL_Y),
     groupNode('g2', 0, 6, 1, 1, '2  RESUME AGENT  (runs only while ON)', '#E6F6EA', '#9ED6AE', '#1E7A3E'),
     groupNode('g3', 0, 3, 2, 3, '3  LINKEDIN / INDEED APPLY', '#F0EAFD', '#C3AEF2', '#6D3FC9'),
     groupNode('g4', 4, 7, 2, 3, '5  FILL, REVIEW & SUBMIT', '#E7F0FD', '#A9C6F2', '#2D61B8'),
@@ -192,7 +193,8 @@ function buildNodes(model: string, resumeOn = false, autoSubmitOn = false, cronO
       cronOn ? 'toggleOn' : 'toggleOff', { toggle: 'cron', badge: cronOn ? 'ON' : 'OFF', badgeOn: cronOn }),
     card('find', 1, 0, '🔎', 'Find jobs', 'JobSpy scrapes LinkedIn / Indeed with your search.', 'find'),
     card('score', 2, 0, '🧮', 'Match scoring', `${model || 'model'} + shared system prompt score each job 0–100.`, 'find'),
-    card('pick', 3, 0, '✅', 'Queue accepted matches', 'Pick jobs on the Jobs page, or the ambient agent queues them. LinkedIn / Indeed must be connected.', 'human'),
+    { ...card('url', 2, 0, '🔗', 'Paste a job URL', 'A LinkedIn / Indeed posting you found yourself. Goes straight to the queue: no match scoring.', 'human'), position: { x: COLX(2), y: URL_Y } },
+    card('pick', 3, 0, '✅', 'Queue jobs', 'Accepted matches you pick, jobs the ambient agent queues, and URLs you paste. LinkedIn / Indeed must be connected.', 'human'),
     card('open', 4, 0, '🌐', 'Open posting', 'New tab in your signed-in LinkedIn or Indeed window.', 'agent'),
     card('login', 5, 0, '🔐', 'Login check', 'Session expired? Log in in the same window.', 'agent'),
     card('log', 6, 0, '📜', 'Agent log + tokens', 'Every AI decision, action and token count is saved per attempt.', 'status'),
@@ -253,6 +255,7 @@ const BASE_EDGES: Edge[] = [
   E('cron', 'find', 'r', 'l', 'straight', { label: 'scheduled', dashed: true }),
   E('find', 'score', 'r', 'l', 'straight'),
   E('score', 'pick', 'r', 'l', 'straight'),
+  E('url', 'pick', 'r', 't', 'hv', { label: 'skips scoring', lp: [COLX(3) - 20, URL_Y + NH / 2] }),
   E('pick', 'open', 'r', 'l', 'straight'),
   E('open', 'login', 'r', 'l', 'straight'),
   E('open', 'log', 't', 't', 'vhv', { chanY: ROWS[0] - 34, dashed: true }),
